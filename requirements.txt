@@ -3,4 +3,8 @@ requests>=2.25.0
 beautifulsoup4>=4.9.0
 PyPDF2>=2.0.0
 tqdm>=4.60.0
+torch>=2.0.0
+transformers>=4.30.0
+accelerate>=0.25.0
+rank-bm25>=0.2.2
 
