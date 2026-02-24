@@ -205,13 +205,13 @@ def llm_verify_paragraph(
     Спрашивает LLM: содержит ли абзац ответ на вопрос?
     Возвращает True если LLM считает, что да.
     """
-    prompt = f"""Текст:
+    prompt = f"""Text:
 {paragraph[:2000]}
 
-Вопрос: {question}
-Ожидаемый краткий ответ: {answer}
+Question: {question}
+Expected short answer: {answer}
 
-Содержит ли приведённый текст этот ответ в явном или неявном виде? Ответь только одним словом: Да или Нет."""
+Does the text above contain this answer in explicit or implicit form? Reply with only one word: Yes or No."""
 
     messages = [{"role": "user", "content": prompt}]
     try:
@@ -255,13 +255,13 @@ def llm_pick_best_chunk(
     if not chunks:
         return -1
     formatted = "\n\n".join(f"[{i+1}]\n{c[:1500]}" for i, c in enumerate(chunks[:MAX_CHUNKS_FOR_LLM]))
-    prompt = f"""Вопрос: {question}
-Ожидаемый краткий ответ: {answer}
+    prompt = f"""Question: {question}
+Expected short answer: {answer}
 
-Фрагменты текста:
+Text fragments:
 {formatted}
 
-В каком по счёту фрагменте [1], [2], ... содержится ответ на вопрос? Ответь только номером (1, 2, 3...) или 0, если ни в одном."""
+Which fragment [1], [2], ... contains the answer to the question? Reply with only the number (1, 2, 3...) or 0 if none."""
 
     messages = [{"role": "user", "content": prompt}]
     try:
@@ -347,13 +347,20 @@ def process_row(
                     break
 
     if not candidate:
-        # Ответ не найден явно — абзацы или чанки, BM25 предфильтр, выбор через LLM
-        combined = ' '.join(all_docs)
-        segments = get_segments(combined)
-        if not segments:
+        # Ответ не найден явно — ищем в каждом документе отдельно
+        # Для каждого документа: сегменты → BM25 top-K → собираем кандидатов
+        all_segments = []
+        for doc in all_docs:
+            doc_segments = get_segments(doc)
+            if not doc_segments:
+                continue
+            # BM25 предфильтр по документу
+            top_segments = bm25_filter_segments(question, doc_segments, BM25_TOP_K)
+            all_segments.extend(top_segments)
+        if not all_segments:
             return ''
-        # BM25 предфильтр: подаём в LLM только top-K релевантных сегментов
-        segments = bm25_filter_segments(question, segments, BM25_TOP_K)
+        # Если кандидатов много — ещё один BM25 проход, чтобы оставить top для LLM
+        segments = bm25_filter_segments(question, all_segments, MAX_CHUNKS_FOR_LLM)
         if use_llm and tokenizer is not None and model is not None:
             best_idx = llm_pick_best_chunk(tokenizer, model, question, answer, segments, enable_thinking)
             if best_idx >= 0:

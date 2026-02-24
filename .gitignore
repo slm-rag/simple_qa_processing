@@ -2,6 +2,7 @@
 simple_qa_test_set_with_documents.csv
 simple_qa_test_set_with_documents*.csv
 simple_qa_test_set.csv
+simple_qa_test_set_with_long_answer.csv
 *.csv.temp
 
 # Логи
