@@ -8,7 +8,7 @@ import requests
 import time
 import json
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from bs4 import BeautifulSoup
 import PyPDF2
 import io
@@ -49,16 +49,135 @@ class OptimizedDocumentDownloader:
             'total_requests': 0,
             'cached_requests': 0,
             'successful_downloads': 0,
-            'failed_downloads': 0
+            'failed_downloads': 0,
+            'wikipedia_api_requests': 0,
+            'wikipedia_api_success': 0
         }
     
     def get_url_hash(self, url: str) -> str:
         """Создает хэш URL для кэширования."""
         return hashlib.md5(url.encode()).hexdigest()
     
+    def is_wikipedia_url(self, url: str) -> bool:
+        """Проверяет, является ли URL ссылкой на Wikipedia."""
+        try:
+            parsed = urlparse(url)
+            hostname = parsed.netloc.lower()
+            # Проверяем различные домены Wikipedia
+            wikipedia_domains = [
+                'en.wikipedia.org',
+                'ru.wikipedia.org',
+                'de.wikipedia.org',
+                'fr.wikipedia.org',
+                'es.wikipedia.org',
+                'it.wikipedia.org',
+                'ja.wikipedia.org',
+                'zh.wikipedia.org',
+                'pt.wikipedia.org',
+                'pl.wikipedia.org',
+                'www.wikipedia.org'
+            ]
+            return any(hostname.endswith(domain) for domain in wikipedia_domains) and '/wiki/' in parsed.path
+        except:
+            return False
+    
+    def extract_wikipedia_title(self, url: str) -> Optional[str]:
+        """Извлекает название статьи из Wikipedia URL."""
+        try:
+            parsed = urlparse(url)
+            if '/wiki/' in parsed.path:
+                # Извлекаем часть после /wiki/
+                title = parsed.path.split('/wiki/')[-1]
+                # Удаляем якоря (#section)
+                title = title.split('#')[0]
+                # Декодируем URL-кодирование
+                title = unquote(title)
+                return title
+            return None
+        except:
+            return None
+    
+    def download_wikipedia_via_api(self, url: str) -> Optional[str]:
+        """Загружает статью Wikipedia через MediaWiki API с сохранением структуры абзацев."""
+        try:
+            title = self.extract_wikipedia_title(url)
+            if not title:
+                return None
+            
+            # Определяем язык из домена
+            parsed = urlparse(url)
+            hostname = parsed.netloc.lower()
+            lang = 'en'  # по умолчанию английский
+            if '.wikipedia.org' in hostname:
+                lang = hostname.split('.')[0]
+            
+            # Используем MediaWiki API с HTML версией для сохранения структуры абзацев
+            api_url = f"https://{lang}.wikipedia.org/w/api.php"
+            params = {
+                'action': 'query',
+                'prop': 'extracts',
+                'exintro': False,  # Получаем полный текст, а не только введение
+                'explaintext': False,  # HTML версия для сохранения структуры
+                'format': 'json',
+                'titles': title
+            }
+            
+            self.stats['wikipedia_api_requests'] += 1
+            response = self.session.get(api_url, params=params, timeout=self.timeout)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # Извлекаем HTML из ответа API
+            pages = data.get('query', {}).get('pages', {})
+            for page_id, page_data in pages.items():
+                html_content = page_data.get('extract', '')
+                if html_content:
+                    # Парсим HTML и извлекаем текст с сохранением структуры абзацев
+                    soup = BeautifulSoup(html_content, 'html.parser')
+                    
+                    # Удаляем скрипты и стили
+                    for script in soup(["script", "style"]):
+                        script.decompose()
+                    
+                    # Извлекаем текст, сохраняя структуру абзацев
+                    # Заменяем <p> на двойные переносы строк, <br> на одинарные
+                    for p in soup.find_all('p'):
+                        p.append('\n\n')
+                    for br in soup.find_all('br'):
+                        br.replace_with('\n')
+                    
+                    text = soup.get_text()
+                    
+                    # Очищаем текст, но сохраняем структуру абзацев
+                    lines = []
+                    for line in text.splitlines():
+                        stripped = line.strip()
+                        if stripped:  # Пропускаем пустые строки
+                            lines.append(stripped)
+                        elif lines and lines[-1]:  # Добавляем пустую строку между абзацами
+                            lines.append('')
+                    
+                    # Убираем лишние пустые строки в начале и конце
+                    while lines and not lines[0]:
+                        lines.pop(0)
+                    while lines and not lines[-1]:
+                        lines.pop()
+                    
+                    result = '\n\n'.join(lines)
+                    if result:
+                        self.stats['wikipedia_api_success'] += 1
+                        return result
+            
+            return None
+        except Exception as e:
+            logger.debug(f"Ошибка при загрузке Wikipedia через API для {url}: {e}")
+            return None
+    
     def download_document(self, url: str) -> Optional[str]:
         """
         Скачивает документ по URL с кэшированием.
+        Для Wikipedia использует API вместо парсинга HTML.
         """
         # Проверяем кэш
         url_hash = self.get_url_hash(url)
@@ -68,6 +187,18 @@ class OptimizedDocumentDownloader:
         
         self.stats['total_requests'] += 1
         
+        # Если это Wikipedia URL, используем API
+        if self.is_wikipedia_url(url):
+            content = self.download_wikipedia_via_api(url)
+            if content:
+                self.document_cache[url_hash] = content
+                self.stats['successful_downloads'] += 1
+                return content
+            else:
+                # Если API не сработал, пробуем обычный способ как fallback
+                logger.debug(f"Wikipedia API не вернул данные для {url}, пробуем обычный способ")
+        
+        # Обычная загрузка для не-Wikipedia URL или fallback для Wikipedia
         try:
             response = self.session.get(url, timeout=self.timeout)
             response.raise_for_status()
@@ -78,6 +209,7 @@ class OptimizedDocumentDownloader:
             if 'pdf' in content_type or url.lower().endswith('.pdf'):
                 content = self._extract_pdf_text(response.content)
             elif 'html' in content_type or url.lower().endswith(('.html', '.htm')):
+                # Для Wikipedia URL все равно парсим HTML как fallback
                 content = self._extract_html_text(response.text)
             elif 'text' in content_type or url.lower().endswith('.txt'):
                 content = response.text
@@ -246,6 +378,8 @@ def process_dataset_full(input_file: str, output_file: str):
                 logger.info(f"  Кэшированных запросов: {downloader.stats['cached_requests']}")
                 logger.info(f"  Успешных загрузок: {downloader.stats['successful_downloads']}")
                 logger.info(f"  Неудачных загрузок: {downloader.stats['failed_downloads']}")
+                logger.info(f"  Wikipedia API запросов: {downloader.stats['wikipedia_api_requests']}")
+                logger.info(f"  Wikipedia API успешных: {downloader.stats['wikipedia_api_success']}")
             
         except Exception as e:
             logger.error(f"Ошибка при обработке строки {idx + 1}: {e}")
@@ -277,6 +411,8 @@ def process_dataset_full(input_file: str, output_file: str):
     logger.info(f"Кэшированных запросов: {downloader.stats['cached_requests']}")
     logger.info(f"Успешных загрузок: {downloader.stats['successful_downloads']}")
     logger.info(f"Неудачных загрузок: {downloader.stats['failed_downloads']}")
+    logger.info(f"Wikipedia API запросов: {downloader.stats['wikipedia_api_requests']}")
+    logger.info(f"Wikipedia API успешных: {downloader.stats['wikipedia_api_success']}")
     
     # Сохраняем итоговый отчет
     save_final_report(total_rows, successful_downloads, failed_downloads, downloader.stats, output_file)
@@ -323,9 +459,12 @@ def save_final_report(total_rows, successful_downloads, failed_downloads, stats,
         f.write("-" * 20 + "\n")
         f.write("• Обрабатывались документы по URL из поля 'urls' в метаданных\n")
         f.write("• Поддерживаемые форматы: HTML, PDF, текстовые файлы\n")
+        f.write("• Wikipedia статьи загружаются через MediaWiki API (более надежно и быстро)\n")
         f.write("• Использовалось параллельное скачивание (до 5 потоков)\n")
         f.write("• Применялось кэширование для избежания повторных запросов\n")
-        f.write("• Промежуточные результаты сохранялись каждые 100 строк\n\n")
+        f.write("• Промежуточные результаты сохранялись каждые 100 строк\n")
+        f.write(f"• Wikipedia API запросов: {stats.get('wikipedia_api_requests', 0):,}\n")
+        f.write(f"• Wikipedia API успешных: {stats.get('wikipedia_api_success', 0):,}\n\n")
         
         f.write("ФАЙЛЫ РЕЗУЛЬТАТОВ:\n")
         f.write("-" * 20 + "\n")
