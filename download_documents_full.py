@@ -98,7 +98,7 @@ class OptimizedDocumentDownloader:
             return None
     
     def download_wikipedia_via_api(self, url: str) -> Optional[str]:
-        """Загружает статью Wikipedia через MediaWiki API с сохранением структуры абзацев."""
+        """Загружает полную статью Wikipedia через MediaWiki API (action=parse)."""
         try:
             title = self.extract_wikipedia_title(url)
             if not title:
@@ -111,15 +111,13 @@ class OptimizedDocumentDownloader:
             if '.wikipedia.org' in hostname:
                 lang = hostname.split('.')[0]
             
-            # Используем MediaWiki API с HTML версией для сохранения структуры абзацев
+            # action=parse возвращает полный текст статьи (в отличие от prop=extracts с лимитом ~1200 символов)
             api_url = f"https://{lang}.wikipedia.org/w/api.php"
             params = {
-                'action': 'query',
-                'prop': 'extracts',
-                'exintro': False,  # Получаем полный текст, а не только введение
-                'explaintext': False,  # HTML версия для сохранения структуры
-                'format': 'json',
-                'titles': title
+                'action': 'parse',
+                'page': title,
+                'prop': 'text',
+                'format': 'json'
             }
             
             self.stats['wikipedia_api_requests'] += 1
@@ -127,52 +125,74 @@ class OptimizedDocumentDownloader:
             response.raise_for_status()
             
             data = response.json()
+            parse_data = data.get('parse', {})
+            html_content = parse_data.get('text', {}).get('*', '')
             
-            # Извлекаем HTML из ответа API
-            pages = data.get('query', {}).get('pages', {})
-            for page_id, page_data in pages.items():
-                html_content = page_data.get('extract', '')
-                if html_content:
-                    # Парсим HTML и извлекаем текст с сохранением структуры абзацев
-                    soup = BeautifulSoup(html_content, 'html.parser')
-                    
-                    # Удаляем скрипты и стили
-                    for script in soup(["script", "style"]):
-                        script.decompose()
-                    
-                    # Извлекаем текст, сохраняя структуру абзацев
-                    # Заменяем <p> на двойные переносы строк, <br> на одинарные
-                    for p in soup.find_all('p'):
-                        p.append('\n\n')
-                    for br in soup.find_all('br'):
-                        br.replace_with('\n')
-                    
-                    text = soup.get_text()
-                    
-                    # Очищаем текст, но сохраняем структуру абзацев
-                    lines = []
-                    for line in text.splitlines():
-                        stripped = line.strip()
-                        if stripped:  # Пропускаем пустые строки
-                            lines.append(stripped)
-                        elif lines and lines[-1]:  # Добавляем пустую строку между абзацами
-                            lines.append('')
-                    
-                    # Убираем лишние пустые строки в начале и конце
-                    while lines and not lines[0]:
-                        lines.pop(0)
-                    while lines and not lines[-1]:
-                        lines.pop()
-                    
-                    result = '\n\n'.join(lines)
-                    if result:
-                        self.stats['wikipedia_api_success'] += 1
-                        return result
+            if html_content:
+                result = self._clean_wikipedia_html(html_content)
+                if result:
+                    self.stats['wikipedia_api_success'] += 1
+                    return result
             
             return None
         except Exception as e:
             logger.debug(f"Ошибка при загрузке Wikipedia через API для {url}: {e}")
             return None
+    
+    def _clean_wikipedia_html(self, html_content: str) -> str:
+        """
+        Извлекает текст из HTML Wikipedia, убирая мусор:
+        - скрипты, стили, инфобоксы-заголовки
+        - секцию References
+        - ссылки [edit], служебные элементы
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Удаляем скрипты и стили
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        
+        # Удаляем секцию References (списки источников)
+        for ref in soup.find_all(class_=lambda c: c and ('reflist' in c or 'references' in c)):
+            ref.decompose()
+        
+        # Удаляем hatnotes (подсказки типа "Main article: ...")
+        for tag in soup.find_all(class_='hatnote'):
+            tag.decompose()
+        
+        # Удаляем ambox (предупреждения, шаблоны)
+        for tag in soup.find_all(class_=lambda c: c and 'ambox' in c):
+            tag.decompose()
+        
+        # Удаляем ссылки [edit]
+        for tag in soup.find_all('span', class_='mw-editsection'):
+            tag.decompose()
+        
+        # Ссылки-сноски [1], [2] оставляем — они часть текста; при необходимости можно убрать regex'ом
+        
+        # Извлекаем текст с сохранением структуры абзацев
+        for p in soup.find_all('p'):
+            p.append('\n\n')
+        for br in soup.find_all('br'):
+            br.replace_with('\n')
+        
+        text = soup.get_text()
+        
+        # Очищаем: убираем лишние пробелы, сохраняем структуру абзацев
+        lines = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped:
+                lines.append(stripped)
+            elif lines and lines[-1]:
+                lines.append('')
+        
+        while lines and not lines[0]:
+            lines.pop(0)
+        while lines and not lines[-1]:
+            lines.pop()
+        
+        return '\n\n'.join(lines) if lines else ''
     
     def download_document(self, url: str) -> Optional[str]:
         """

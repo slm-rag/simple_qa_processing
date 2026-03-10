@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Скрипт для анализа статистики датасета simple_qa_test_set_with_documents.csv
+Скрипт для анализа статистики датасета simple_qa_test_set_with_long_answer.csv
 """
 
 import pandas as pd
@@ -55,6 +55,30 @@ def parse_documents(documents_str: str) -> List[str]:
         # Если ничего не получилось, возвращаем пустой список
         return []
 
+
+def parse_long_answer(long_answer_str: str) -> List[str]:
+    """Парсит строку с long_answer в список фрагментов."""
+    if pd.isna(long_answer_str) or long_answer_str == '' or long_answer_str == '[]':
+        return []
+    try:
+        if isinstance(long_answer_str, str):
+            long_answer_str = long_answer_str.strip()
+            if long_answer_str == '[]' or long_answer_str in ("''", '""'):
+                return []
+            try:
+                parsed = ast.literal_eval(long_answer_str)
+            except (ValueError, SyntaxError):
+                parsed = json.loads(long_answer_str)
+            if isinstance(parsed, list):
+                return [str(frag) for frag in parsed if frag and str(frag).strip()]
+            return []
+        if isinstance(long_answer_str, list):
+            return [str(frag) for frag in long_answer_str if frag and str(frag).strip()]
+        return []
+    except Exception:
+        return []
+
+
 def parse_metadata(metadata_str: str) -> Dict[str, Any]:
     """Парсит metadata для получения URLs."""
     if pd.isna(metadata_str) or metadata_str == '':
@@ -73,6 +97,22 @@ def parse_metadata(metadata_str: str) -> Dict[str, Any]:
         return metadata if isinstance(metadata, dict) else {'urls': []}
     except Exception as e:
         return {'urls': []}
+
+def is_wikipedia_url(url: str) -> bool:
+    """Проверяет, является ли URL ссылкой на Wikipedia."""
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.netloc.lower()
+        wikipedia_domains = [
+            'en.wikipedia.org', 'ru.wikipedia.org', 'de.wikipedia.org',
+            'fr.wikipedia.org', 'es.wikipedia.org', 'it.wikipedia.org',
+            'ja.wikipedia.org', 'zh.wikipedia.org', 'pt.wikipedia.org',
+            'pl.wikipedia.org', 'www.wikipedia.org'
+        ]
+        return any(hostname.endswith(d) for d in wikipedia_domains) and '/wiki/' in parsed.path
+    except Exception:
+        return False
+
 
 def get_document_format(url: str) -> str:
     """Определяет формат документа по URL."""
@@ -138,25 +178,55 @@ def analyze_row(row: pd.Series) -> Dict[str, Any]:
         'answer_found_in_documents': False,
         'answer_position_words': None,
         'answer_position_chars': None,
-        'answer_found_in_doc_index': None
+        'answer_found_in_doc_index': None,
+        'num_long_answer_fragments': 0,
+        'total_long_answer_words': 0,
+        'avg_long_answer_fragment_words': 0.0,
+        'answer_found_in_long_answer': False,
+        'num_documents_from_wikipedia': 0,
+        'num_documents_from_other': 0,
     }
     
     # Парсим документы
     documents = parse_documents(row.get('documents', ''))
     result['num_documents'] = len(documents)
     
+    # Парсим long_answer
+    long_answer_fragments = parse_long_answer(row.get('long_answer', ''))
+    result['num_long_answer_fragments'] = len(long_answer_fragments)
+    
+    if long_answer_fragments:
+        frag_lengths = [count_words(f) for f in long_answer_fragments]
+        result['total_long_answer_words'] = sum(frag_lengths)
+        result['avg_long_answer_fragment_words'] = statistics.mean(frag_lengths)
+        answer = row.get('answer', '')
+        if answer:
+            answer_lower = str(answer).strip().lower()
+            result['answer_found_in_long_answer'] = any(
+                answer_lower in frag.lower() for frag in long_answer_fragments
+            )
+    
     if len(documents) == 0:
         return result
     
-    # Определяем форматы документов из metadata
+    # Определяем форматы документов и источники (Wikipedia / другие) из metadata
     metadata = parse_metadata(row.get('metadata', ''))
     urls = metadata.get('urls', [])
     formats = []
-    for url in urls:
+    wikipedia_count = 0
+    other_count = 0
+    for i, url in enumerate(urls):
         fmt = get_document_format(url)
-        if fmt != 'unknown':
-            formats.append(fmt)
+        formats.append(fmt)  # всегда добавляем (включая unknown), чтобы сходилось с числом документов
+        # Документы и URL в одном порядке; считаем только успешно загруженные (непустые)
+        if i < len(documents) and documents[i] and str(documents[i]).strip():
+            if is_wikipedia_url(url):
+                wikipedia_count += 1
+            else:
+                other_count += 1
     result['document_formats'] = formats if formats else ['unknown']
+    result['num_documents_from_wikipedia'] = wikipedia_count
+    result['num_documents_from_other'] = other_count
     
     # Вычисляем среднюю длину документов в словах
     doc_lengths = [count_words(doc) for doc in documents]
@@ -178,8 +248,8 @@ def analyze_row(row: pd.Series) -> Dict[str, Any]:
     return result
 
 def main():
-    input_file = '/home/dolganov/simple_qa/simple_qa_test_set_with_documents.csv'
-    output_file = '/home/dolganov/simple_qa/simple_qa_test_set_with_documents.csv'
+    input_file = '/home/dolganov/simple_qa/simple_qa_test_set_with_long_answer.csv'
+    output_file = '/home/dolganov/simple_qa/simple_qa_test_set_with_long_answer.csv'
     stats_file = '/home/dolganov/simple_qa/dataset_statistics.txt'
     
     print(f"Загрузка датасета из {input_file}...")
@@ -214,7 +284,13 @@ def main():
                     'answer_found_in_documents': False,
                     'answer_position_words': None,
                     'answer_position_chars': None,
-                    'answer_found_in_doc_index': None
+                    'answer_found_in_doc_index': None,
+                    'num_long_answer_fragments': 0,
+                    'total_long_answer_words': 0,
+                    'avg_long_answer_fragment_words': 0.0,
+                    'answer_found_in_long_answer': False,
+                    'num_documents_from_wikipedia': 0,
+                    'num_documents_from_other': 0,
                 })
         all_results.extend(chunk_results)
     
@@ -223,13 +299,16 @@ def main():
     df = pd.read_csv(input_file)
     
     # Удаляем старые колонки статистики, если они есть
-    cols_to_remove = ['num_documents', 'document_formats', 'avg_document_length_words', 
-                      'answer_found_in_documents', 'answer_position_words', 
-                      'answer_position_chars', 'answer_found_in_doc_index']
+    cols_to_remove = ['num_documents', 'document_formats', 'avg_document_length_words',
+                      'answer_found_in_documents', 'answer_position_words',
+                      'answer_position_chars', 'answer_found_in_doc_index',
+                      'num_long_answer_fragments', 'total_long_answer_words',
+                      'avg_long_answer_fragment_words', 'answer_found_in_long_answer',
+                      'num_documents_from_wikipedia', 'num_documents_from_other']
     for col in cols_to_remove:
         if col in df.columns:
             df = df.drop(columns=[col])
-    
+
     # Добавляем новые колонки
     df['num_documents'] = [r['num_documents'] for r in all_results]
     df['document_formats'] = [','.join(r['document_formats']) if r['document_formats'] else '' for r in all_results]
@@ -238,6 +317,12 @@ def main():
     df['answer_position_words'] = [r['answer_position_words'] if r['answer_position_words'] is not None else '' for r in all_results]
     df['answer_position_chars'] = [r['answer_position_chars'] if r['answer_position_chars'] is not None else '' for r in all_results]
     df['answer_found_in_doc_index'] = [r['answer_found_in_doc_index'] if r['answer_found_in_doc_index'] is not None else '' for r in all_results]
+    df['num_long_answer_fragments'] = [r['num_long_answer_fragments'] for r in all_results]
+    df['total_long_answer_words'] = [r['total_long_answer_words'] for r in all_results]
+    df['avg_long_answer_fragment_words'] = [r['avg_long_answer_fragment_words'] for r in all_results]
+    df['answer_found_in_long_answer'] = [r['answer_found_in_long_answer'] for r in all_results]
+    df['num_documents_from_wikipedia'] = [r['num_documents_from_wikipedia'] for r in all_results]
+    df['num_documents_from_other'] = [r['num_documents_from_other'] for r in all_results]
     
     print(f"Сохранение обновленного датасета в {output_file}...")
     df.to_csv(output_file, index=False)
@@ -248,9 +333,20 @@ def main():
     questions_without_docs = sum(1 for n in num_docs_list if n == 0)
     avg_doc_lengths = [r['avg_document_length_words'] for r in all_results if r['avg_document_length_words'] > 0]
     answer_found_count = sum(1 for r in all_results if r['answer_found_in_documents'])
-    answer_positions_words = [r['answer_position_words'] for r in all_results 
+    answer_positions_words = [r['answer_position_words'] for r in all_results
                           if r['answer_position_words'] is not None]
-    
+
+    # Статистика по источникам документов
+    total_wikipedia_docs = sum(r['num_documents_from_wikipedia'] for r in all_results)
+    total_other_docs = sum(r['num_documents_from_other'] for r in all_results)
+    total_docs_all = total_wikipedia_docs + total_other_docs
+
+    # Статистика по long_answer
+    num_fragments_list = [r['num_long_answer_fragments'] for r in all_results]
+    questions_without_long_answer = sum(1 for n in num_fragments_list if n == 0)
+    avg_frag_lengths = [r['avg_long_answer_fragment_words'] for r in all_results if r['avg_long_answer_fragment_words'] > 0]
+    answer_in_long_answer_count = sum(1 for r in all_results if r['answer_found_in_long_answer'])
+
     # Статистика по форматам
     all_formats = []
     for r in all_results:
@@ -258,10 +354,10 @@ def main():
     format_counts = {}
     for fmt in all_formats:
         format_counts[fmt] = format_counts.get(fmt, 0) + 1
-    
+
     # Генерируем отчет
     stats_report = f"""
-СТАТИСТИКА ПО ДАТАСЕТУ: simple_qa_test_set_with_documents.csv
+СТАТИСТИКА ПО ДАТАСЕТУ: simple_qa_test_set_with_long_answer.csv
 {'='*60}
 
 1. КОЛИЧЕСТВО ДОКУМЕНТОВ НА ВОПРОС:
@@ -290,10 +386,38 @@ def main():
    Максимальная: {max(answer_positions_words) if answer_positions_words else 0:.0f}
    Минимальная: {min(answer_positions_words) if answer_positions_words else 0:.0f}
 
-5. ФОРМАТЫ ДОКУМЕНТОВ:
+5. LONG_ANSWER (извлечённые фрагменты):
+   Количество фрагментов на вопрос:
+   Среднее: {statistics.mean(num_fragments_list):.2f}
+   Медиана: {statistics.median(num_fragments_list):.2f}
+   Максимальное: {max(num_fragments_list)}
+   Минимальное: {min(num_fragments_list)}
+   
+   Вопросов без long_answer: {questions_without_long_answer}
+   Процент от общего числа: {questions_without_long_answer / len(all_results) * 100:.2f}%
+   
+   Средняя длина фрагмента (слов):
+   Среднее: {statistics.mean(avg_frag_lengths) if avg_frag_lengths else 0:.2f}
+   Медиана: {statistics.median(avg_frag_lengths) if avg_frag_lengths else 0:.2f}
+   
+   Ответ найден в long_answer: {answer_in_long_answer_count}
+   Процент от общего числа: {answer_in_long_answer_count / len(all_results) * 100:.2f}%
+
+6. ФОРМАТЫ ДОКУМЕНТОВ:
 """
     for fmt, count in sorted(format_counts.items(), key=lambda x: -x[1]):
         stats_report += f"   {fmt}: {count} ({count / len(all_formats) * 100:.2f}%)\n"
+
+    total_formats = sum(len(r['document_formats']) for r in all_results)
+    stats_report += f"""
+7. ИСТОЧНИКИ ДОКУМЕНТОВ (успешно загруженные):
+   Из Wikipedia: {total_wikipedia_docs:,}
+   Из других источников: {total_other_docs:,}
+   Всего документов: {total_docs_all:,}
+"""
+    if total_docs_all > 0:
+        stats_report += f"   Wikipedia: {total_wikipedia_docs / total_docs_all * 100:.1f}%  |  Другие: {total_other_docs / total_docs_all * 100:.1f}%\n"
+    stats_report += f"\n   Сводка: всего URL/слотов (форматы): {total_formats:,}  |  успешно загружено (источники): {total_docs_all:,}\n"
     
     stats_report += f"\n{'='*60}\n"
     stats_report += f"Всего обработано строк: {len(all_results)}\n"

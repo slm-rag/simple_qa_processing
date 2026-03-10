@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Извлечение абзаца (long_answer) из документов для каждого вопроса.
-- Для answer_found_in_documents: окно вокруг позиции ответа + проверка LLM
-- Для остальных: разбивка на чанки + выбор лучшего через LLM (Qwen3-8B)
+Извлечение релевантных фрагментов (long_answer) из документов для каждого вопроса.
+- Самостоятельно определяет наличие ответа в документе (поиск подстроки)
+- Для документа с ответом: окно вокруг позиции ответа (вариант 1)
+- Для остальных документов: разбивка на чанки + BM25 + выбор через LLM (вариант 2)
+- long_answer — список уникальных фрагментов (без дубликатов после нормализации)
 """
 
 import csv
 import ast
+import json
 import re
 import argparse
 from typing import List, Optional, Tuple
@@ -22,6 +25,8 @@ MAX_CHUNKS_FOR_LLM = 8  # макс. чанков для выбора (огран
 BM25_TOP_K = 5  # BM25 предфильтр: сколько сегментов подавать в LLM
 MAX_PARAGRAPH_WORDS = 600  # абзац больше — считаем "слишком большим", используем чанки
 MIN_PARAGRAPHS = 2  # минимум абзацев, чтобы использовать разбивку по абзацам
+ADJACENT_PARAGRAPHS = 1  # соседних абзацев с каждой стороны для контекста (1 = до 3 абзацев)
+MAX_EXPANDED_WORDS = 500  # макс. слов при расширении контекстом
 # Qwen2.5-7B-Instruct: совместим с Python 3.8 и transformers 4.37+
 # Qwen3-8B требует transformers>=4.51 и Python>=3.9
 MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
@@ -47,6 +52,65 @@ def parse_documents(documents_str: str) -> List[str]:
             return []
         except Exception:
             return []
+
+
+def normalize_for_dedup(text: str) -> str:
+    """Нормализация текста для сравнения на дубликаты."""
+    if not text:
+        return ''
+    return re.sub(r'\s+', ' ', text.strip())
+
+
+def deduplicate_fragments(fragments: List[str]) -> List[str]:
+    """Удаляет дубликаты после нормализации. Пустые фрагменты не добавляются."""
+    seen = set()
+    result = []
+    for f in fragments:
+        s = f.strip()
+        if not s:
+            continue
+        norm = normalize_for_dedup(s)
+        if norm and norm not in seen:
+            seen.add(norm)
+            result.append(s)
+    return result
+
+
+# Паттерны для определения мусорных фрагментов (навигация, меню, заголовки)
+_JUNK_WORDS = re.compile(
+    r'\b(sign\s*up|login|sign\s*in|logout|profile|privacy\s*policy|terms\s*of\s*use|'
+    r'contact\s*us|navigation|toggle|menu|cookie|newsletter|subscribe)\b',
+    re.I
+)
+
+
+def is_likely_junk(text: str, answer: str = '') -> bool:
+    """
+    Определяет, похож ли фрагмент на навигацию/меню/заголовок.
+    Такие фрагменты отфильтровываются из результата.
+    Если в фрагменте есть ответ — не считаем мусором (контент важнее навигации).
+    """
+    if not text or not text.strip():
+        return True
+    text_lower = text.lower()
+    words = text.split()
+    # Фрагмент содержит ответ — сохраняем, даже если есть навигация
+    if answer and answer.strip() and answer.lower() in text_lower:
+        return False
+    # Очень короткий фрагмент без точки — скорее заголовок или пункт меню
+    if len(words) < 12 and '.' not in text:
+        return True
+    # Много типичных слов навигации
+    if len(_JUNK_WORDS.findall(text_lower)) >= 3:
+        return True
+    # Много разделителей | или · (пункты меню, навигация)
+    if text.count('|') + text.count('·') >= 8:
+        return True
+    # Начинается с типичной навигации
+    nav_start = text_lower[:150]
+    if any(nav_start.startswith(p) for p in ('skip to', 'toggle navigation', 'sign up')):
+        return True
+    return False
 
 
 def extract_context_window(
@@ -120,19 +184,25 @@ def tokenize_for_bm25(text: str) -> List[str]:
     return re.findall(r'\b\w+\b', text.lower()) if text else []
 
 
-def bm25_filter_segments(question: str, segments: List[str], top_k: int = BM25_TOP_K) -> List[str]:
+def bm25_filter_segments(
+    question: str,
+    segments: List[str],
+    top_k: int = BM25_TOP_K,
+    answer: str = '',
+) -> List[str]:
     """
-    BM25 предфильтр: возвращает top_k наиболее релевантных сегментов по вопросу.
-    Уменьшает нагрузку на LLM.
+    BM25 предфильтр: возвращает top_k наиболее релевантных сегментов.
+    Запрос: вопрос + ответ (если задан).
     """
-    if not segments or not question:
+    query = f'{question} {answer}'.strip() if answer else question
+    if not segments or not query:
         return segments
     if len(segments) <= top_k:
         return segments
     try:
         from rank_bm25 import BM25Okapi
         tokenized_corpus = [tokenize_for_bm25(s) for s in segments]
-        tokenized_query = tokenize_for_bm25(question)
+        tokenized_query = tokenize_for_bm25(query)
         if not tokenized_query:
             return segments[:top_k]
         bm25 = BM25Okapi(tokenized_corpus)
@@ -146,6 +216,29 @@ def bm25_filter_segments(question: str, segments: List[str], top_k: int = BM25_T
         return segments[:top_k]
     except Exception:
         return segments[:top_k]
+
+
+def expand_segment_with_context(
+    best_segment: str,
+    doc_segments: List[str],
+    max_words: int = MAX_EXPANDED_WORDS,
+    adjacent: int = ADJACENT_PARAGRAPHS,
+) -> str:
+    """
+    Расширяет выбранный сегмент соседними абзацами для контекста.
+    Возвращает объединённый текст (best + prev + next), ограниченный max_words.
+    """
+    if not doc_segments or best_segment not in doc_segments:
+        return best_segment
+    idx = doc_segments.index(best_segment)
+    start = max(0, idx - adjacent)
+    end = min(len(doc_segments), idx + adjacent + 1)
+    expanded = '\n\n'.join(doc_segments[start:end])
+    if count_words(expanded) <= max_words:
+        return expanded
+    # Обрезаем с конца, оставляя max_words
+    words = expanded.split()
+    return ' '.join(words[:max_words])
 
 
 def get_segments(text: str) -> List[str]:
@@ -298,86 +391,91 @@ Which fragment [1], [2], ... contains the answer to the question? Reply with onl
     return 0  # fallback: первый чанк
 
 
+def _get_fragment_variant1(
+    doc: str,
+    answer: str,
+    pos_chars: int,
+) -> str:
+    """Вариант 1: извлечение по позиции ответа (документ с совпадением)."""
+    para = get_paragraph_containing_position(doc, pos_chars)
+    if para and count_words(para) <= MAX_PARAGRAPH_WORDS:
+        return para
+    return extract_context_window(doc, answer, pos_chars)
+
+
+def _get_fragment_variant2(
+    doc: str,
+    question: str,
+    answer: str,
+    tokenizer,
+    model,
+    use_llm: bool,
+    enable_thinking: bool,
+) -> str:
+    """Вариант 2: BM25 + LLM для документа без явного совпадения."""
+    doc_segments = get_segments(doc)
+    if not doc_segments:
+        return ''
+    top_segments = bm25_filter_segments(question, doc_segments, BM25_TOP_K, answer)
+    if not top_segments:
+        return ''
+    # Отфильтровываем мусор (навигация, меню)
+    # Приоритет: 1) не-мусор, 2) с ответом (если всё мусор — берём то, где есть ответ)
+    candidates = [s for s in top_segments if not is_likely_junk(s, '')]
+    if not candidates and answer:
+        candidates = [s for s in top_segments if answer.lower() in s.lower()]
+    if not candidates:
+        extended = bm25_filter_segments(question, doc_segments, top_k=min(15, len(doc_segments)), answer=answer)
+        candidates = [s for s in extended if not is_likely_junk(s, '')]
+        if not candidates and answer:
+            candidates = [s for s in extended if answer.lower() in s.lower()]
+    segments_for_pick = candidates if candidates else top_segments
+    if use_llm and tokenizer is not None and model is not None:
+        best_idx = llm_pick_best_chunk(
+            tokenizer, model, question, answer, segments_for_pick, enable_thinking
+        )
+        best = segments_for_pick[best_idx] if best_idx >= 0 else segments_for_pick[0]
+    else:
+        best = segments_for_pick[0] if segments_for_pick else ''
+    if best:
+        return expand_segment_with_context(best, doc_segments)
+    return ''
+
+
 def process_row(
     row: dict,
     tokenizer,
     model,
     use_llm: bool = True,
     enable_thinking: bool = False
-) -> str:
+) -> List[str]:
     """
-    Обрабатывает одну строку, возвращает long_answer.
+    Обрабатывает одну строку. Для каждого документа находит релевантный фрагмент.
+    Возвращает список уникальных фрагментов (без дубликатов после нормализации).
     """
     documents = parse_documents(row.get('documents', ''))
     question = str(row.get('problem', '')).strip()
     answer = str(row.get('answer', '')).strip()
-    answer_found = str(row.get('answer_found_in_documents', '')).strip().lower() in ('true', '1', 'yes')
-    pos_chars = row.get('answer_position_chars', '')
-    doc_idx = row.get('answer_found_in_doc_index', '')
 
     if not documents or not question:
-        return ''
+        return []
 
-    # Собираем все документы в один текст для поиска
-    all_docs = documents
-    candidate = ''
-
-    if answer_found and pos_chars != '' and doc_idx != '':
-        try:
-            idx = int(doc_idx)
-            pos = int(pos_chars)
-            if 0 <= idx < len(documents):
-                doc = documents[idx]
-                # Сначала пробуем абзац, содержащий ответ
-                para = get_paragraph_containing_position(doc, pos)
-                if para and count_words(para) <= MAX_PARAGRAPH_WORDS:
-                    candidate = para
-                else:
-                    candidate = extract_context_window(doc, answer, pos_chars)
-        except (ValueError, TypeError):
-            pass
-
-        if not candidate and documents:
-            # Fallback: ищем во всех документах
-            for doc in documents:
-                if answer.lower() in doc.lower():
-                    pos = doc.lower().find(answer.lower())
-                    para = get_paragraph_containing_position(doc, pos)
-                    candidate = para if para else extract_context_window(doc, answer, pos)
-                    break
-
-    if not candidate:
-        # Ответ не найден явно — ищем в каждом документе отдельно
-        # Для каждого документа: сегменты → BM25 top-K → собираем кандидатов
-        all_segments = []
-        for doc in all_docs:
-            doc_segments = get_segments(doc)
-            if not doc_segments:
-                continue
-            # BM25 предфильтр по документу
-            top_segments = bm25_filter_segments(question, doc_segments, BM25_TOP_K)
-            all_segments.extend(top_segments)
-        if not all_segments:
-            return ''
-        # Если кандидатов много — ещё один BM25 проход, чтобы оставить top для LLM
-        segments = bm25_filter_segments(question, all_segments, MAX_CHUNKS_FOR_LLM)
-        if use_llm and tokenizer is not None and model is not None:
-            best_idx = llm_pick_best_chunk(tokenizer, model, question, answer, segments, enable_thinking)
-            if best_idx >= 0:
-                candidate = segments[best_idx]
-            else:
-                candidate = segments[0]  # fallback
+    fragments = []
+    for i, doc in enumerate(documents):
+        candidate = ''
+        # Самостоятельно определяем: есть ли ответ в документе
+        if answer and answer.lower() in doc.lower():
+            pos_int = doc.lower().find(answer.lower())
+            candidate = _get_fragment_variant1(doc, answer, pos_int)
         else:
-            candidate = segments[0]
+            candidate = _get_fragment_variant2(
+                doc, question, answer, tokenizer, model, use_llm, enable_thinking
+            )
 
-    # Финальная проверка LLM для answer_found
-    if candidate and use_llm and tokenizer is not None and model is not None and answer_found:
-        if not llm_verify_paragraph(tokenizer, model, question, answer, candidate, enable_thinking):
-            # LLM не подтвердил — можно попробовать расширить окно или оставить как есть
-            # Оставляем candidate, т.к. answer точно есть в документе
-            pass
+        if candidate and candidate.strip() and not is_likely_junk(candidate, answer):
+            fragments.append(candidate.strip())
 
-    return candidate
+    return deduplicate_fragments(fragments)
 
 
 def main():
@@ -420,7 +518,9 @@ def main():
     rows = []
     with open(args.input, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
-        fieldnames = list(reader.fieldnames) + ['long_answer']
+        fieldnames = list(reader.fieldnames)
+        if 'long_answer' not in fieldnames:
+            fieldnames.append('long_answer')
         for row in reader:
             rows.append(row)
             if args.limit and len(rows) >= args.limit:
@@ -431,7 +531,8 @@ def main():
 
     from tqdm import tqdm
     for row in tqdm(rows, desc='Извлечение long_answer'):
-        row['long_answer'] = process_row(row, tokenizer, model, use_llm=not args.no_llm, enable_thinking=args.thinking)
+        fragments = process_row(row, tokenizer, model, use_llm=not args.no_llm, enable_thinking=args.thinking)
+        row['long_answer'] = json.dumps(fragments, ensure_ascii=False)
 
     print(f'Сохранение в {args.output}...')
     with open(args.output, 'w', encoding='utf-8', newline='') as f:
@@ -439,8 +540,8 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    filled = sum(1 for r in rows if r.get('long_answer', '').strip())
-    print(f'Готово. Заполнено long_answer: {filled}/{total}')
+    filled = sum(1 for r in rows if json.loads(r.get('long_answer', '[]')))
+    print(f'Готово. Заполнено long_answer (непустой список): {filled}/{total}')
 
 
 if __name__ == '__main__':

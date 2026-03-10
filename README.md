@@ -9,7 +9,8 @@
 ### Датасеты
 
 - **Исходный датасет**: `simple_qa_test_set.csv` - входной датасет с вопросами, ответами и метаданными (URL документов)
-- **Итоговый датасет**: `simple_qa_test_set_with_documents.csv` - обогащенный датасет с добавленным полем `documents`, содержащим тексты скачанных документов
+- **С документами**: `simple_qa_test_set_with_documents.csv` - обогащенный датасет с полем `documents` (тексты скачанных документов)
+- **С long_answer**: `simple_qa_test_set_with_long_answer.csv` - датасет с полем `long_answer` (список релевантных фрагментов из документов)
 
 ## Возможности
 
@@ -17,6 +18,7 @@
 - ✅ Поддержка форматов: HTML, PDF, текстовые файлы
 - ✅ Параллельная обработка (до 5 потоков)
 - ✅ Кэширование документов для избежания повторных запросов
+- ✅ Извлечение релевантных фрагментов (long_answer) из документов для каждого вопроса
 - ✅ Прогресс-бар с отображением статуса обработки
 - ✅ Промежуточное сохранение результатов каждые 100 строк
 - ✅ Детальное логирование процесса
@@ -26,12 +28,8 @@
 ## Требования
 
 - Python 3.8+
-- Зависимости (устанавливаются через pip):
-  - `pandas`
-  - `requests`
-  - `beautifulsoup4`
-  - `PyPDF2`
-  - `tqdm`
+- Для скачивания документов: `pandas`, `requests`, `beautifulsoup4`, `PyPDF2`, `tqdm`
+- Для извлечения long_answer: `torch`, `transformers`, `accelerate`, `rank-bm25` (см. `requirements.txt`)
 
 ## Установка
 
@@ -54,10 +52,7 @@ venv\Scripts\activate  # Windows
 pip install -r requirements.txt
 ```
 
-Или установите вручную:
-```bash
-pip install pandas requests beautifulsoup4 PyPDF2 tqdm
-```
+(включает зависимости для скачивания документов и извлечения long_answer)
 
 ## Структура входного датасета
 
@@ -123,18 +118,42 @@ input_file = "/path/to/input.csv"
 output_file = "/path/to/output.csv"
 ```
 
+### Извлечение long_answer
+
+Скрипт `extract_long_answer.py` извлекает релевантные фрагменты из документов для каждого вопроса. Требует датасет с полем `documents` (результат `download_documents_full.py`).
+
+**Логика:**
+- Для документа с совпадением ответа (`answer_found_in_documents`, `answer_found_in_doc_index`, `answer_position_chars`) — извлечение окна/абзаца вокруг позиции ответа
+- Для остальных документов — разбивка на сегменты, BM25-ранжирование, выбор лучшего чанка через LLM (Qwen2.5-7B-Instruct)
+- Результат — список уникальных фрагментов (дубликаты после нормализации удаляются)
+
+```bash
+python extract_long_answer.py -i simple_qa_test_set_with_documents.csv -o simple_qa_test_set_with_long_answer.csv
+```
+
+Опции:
+- `--no-llm` — без LLM (только BM25, первый чанк)
+- `--thinking` — режим рассуждений (медленнее, точнее)
+- `-n N` — обработать только N строк
+
+Поле `long_answer` сохраняется как JSON-список строк: `["фрагмент 1", "фрагмент 2"]`.
+
 ## Результаты
 
 После завершения обработки создаются следующие файлы:
 
-1. **`simple_qa_test_set_with_documents.csv`** - основной результат с добавленным полем `documents`
-2. **`simple_qa_test_set_with_documents_report.txt`** - итоговый отчет со статистикой
-3. **`download_progress.log`** - лог процесса обработки
+1. **`simple_qa_test_set_with_documents.csv`** — результат скачивания с полем `documents`
+2. **`simple_qa_test_set_with_documents_report.txt`** — отчет со статистикой скачивания
+3. **`simple_qa_test_set_with_long_answer.csv`** — результат извлечения фрагментов с полем `long_answer`
+4. **`download_progress.log`** — лог процесса скачивания
 
-### Структура выходного файла
+### Структура выходных файлов
 
-Выходной CSV содержит все исходные колонки плюс:
-- `documents` - список текстов скачанных документов (JSON массив строк)
+**simple_qa_test_set_with_documents.csv** — все исходные колонки плюс:
+- `documents` — список текстов скачанных документов (JSON массив строк)
+
+**simple_qa_test_set_with_long_answer.csv** — все колонки из входного CSV плюс:
+- `long_answer` — список релевантных фрагментов из документов (JSON массив строк, без дубликатов)
 
 ## Статистика обработки
 
