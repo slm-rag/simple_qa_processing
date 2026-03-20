@@ -22,12 +22,13 @@ from collections import defaultdict
 import signal
 import sys
 
-# Настройка логирования
+# Настройка логирования (лог в папке скрипта)
+_LOG_DIR = os.path.dirname(os.path.abspath(__file__))
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('/home/dolganov/simple_qa/download_progress.log'),
+        logging.FileHandler(os.path.join(_LOG_DIR, 'download_progress.log'), encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -97,59 +98,110 @@ class OptimizedDocumentDownloader:
         except:
             return None
     
+    def _get_wikipedia_wiki(self, lang: str):
+        """Ленивая инициализация wikipediaapi по языку."""
+        if not hasattr(self, '_wiki_clients'):
+            self._wiki_clients = {}
+        if lang not in self._wiki_clients:
+            import wikipediaapi
+            self._wiki_clients[lang] = wikipediaapi.Wikipedia(
+                user_agent='SimpleQA-Processor/1.0 (https://github.com/simple-qa)',
+                language=lang,
+            )
+        return self._wiki_clients[lang]
+    
     def download_wikipedia_via_api(self, url: str) -> Optional[str]:
-        """Загружает полную статью Wikipedia через MediaWiki API (action=parse)."""
+        """Загружает полную статью Wikipedia через wikipedia-api (чистый plain text)."""
         try:
             title = self.extract_wikipedia_title(url)
             if not title:
                 return None
             
-            # Определяем язык из домена
             parsed = urlparse(url)
             hostname = parsed.netloc.lower()
-            lang = 'en'  # по умолчанию английский
+            lang = 'en'
             if '.wikipedia.org' in hostname:
                 lang = hostname.split('.')[0]
             
-            # action=parse возвращает полный текст статьи (в отличие от prop=extracts с лимитом ~1200 символов)
+            self.stats['wikipedia_api_requests'] += 1
+            wiki = self._get_wikipedia_wiki(lang)
+            page = wiki.page(title)
+            
+            if not page.exists():
+                logger.warning(f"Wikipedia страница не найдена: {title}")
+                return None
+            
+            text = page.text
+            if text and text.strip():
+                self.stats['wikipedia_api_success'] += 1
+                logger.info(f"Wikipedia OK (wikipedia-api): {title}")
+                return text.strip()
+            
+            return None
+        except ImportError:
+            logger.warning("wikipedia-api не установлен. pip install wikipedia-api")
+            return self._download_wikipedia_fallback(url)
+        except Exception as e:
+            logger.debug(f"Ошибка wikipedia-api для {url}: {e}")
+            return self._download_wikipedia_fallback(url)
+    
+    def _download_wikipedia_fallback(self, url: str) -> Optional[str]:
+        """Fallback: action=parse + BeautifulSoup (если wikipedia-api недоступен)."""
+        try:
+            title = self.extract_wikipedia_title(url)
+            if not title:
+                return None
+            parsed = urlparse(url)
+            hostname = parsed.netloc.lower()
+            lang = 'en'
+            if '.wikipedia.org' in hostname:
+                lang = hostname.split('.')[0]
             api_url = f"https://{lang}.wikipedia.org/w/api.php"
             params = {
-                'action': 'parse',
-                'page': title,
-                'prop': 'text',
-                'format': 'json'
+                'action': 'parse', 'page': title, 'prop': 'text', 'format': 'json',
+                'disabletoc': 1, 'disableeditsection': 1,
             }
-            
-            self.stats['wikipedia_api_requests'] += 1
             response = self.session.get(api_url, params=params, timeout=self.timeout)
             response.raise_for_status()
-            
-            data = response.json()
-            parse_data = data.get('parse', {})
-            html_content = parse_data.get('text', {}).get('*', '')
-            
+            html_content = response.json().get('parse', {}).get('text', {}).get('*', '')
             if html_content:
                 result = self._clean_wikipedia_html(html_content)
                 if result:
                     self.stats['wikipedia_api_success'] += 1
+                    logger.info(f"Wikipedia OK (fallback): {title}")
                     return result
-            
-            return None
-        except Exception as e:
-            logger.debug(f"Ошибка при загрузке Wikipedia через API для {url}: {e}")
-            return None
+        except Exception:
+            pass
+        return None
     
     def _clean_wikipedia_html(self, html_content: str) -> str:
         """
         Извлекает текст из HTML Wikipedia, убирая мусор:
-        - скрипты, стили, инфобоксы-заголовки
-        - секцию References
+        - навигация, меню, sidebar
+        - скрипты, стили, секция References
         - ссылки [edit], служебные элементы
         """
         soup = BeautifulSoup(html_content, 'html.parser')
         
+        # Берём только основной контент (mw-parser-output) — без навигации и sidebar
+        main_div = soup.find('div', class_='mw-parser-output')
+        if main_div:
+            soup = main_div
+        
         # Удаляем скрипты и стили
         for tag in soup(["script", "style"]):
+            tag.decompose()
+        
+        # Удаляем навигацию, меню, sidebar
+        for tag in soup.find_all(['nav', 'header', 'footer']):
+            tag.decompose()
+        for tag in soup.find_all(class_=lambda c: c and any(
+            x in str(c).lower() for x in ('navigation', 'sidebar', 'vector-menu', 'mw-jump-link', 'noprint')
+        )):
+            tag.decompose()
+        for tag in soup.find_all(id=lambda i: i and any(
+            x in str(i).lower() for x in ('mw-head', 'mw-panel', 'mw-navigation', 'mw-page-base')
+        )):
             tag.decompose()
         
         # Удаляем секцию References (списки источников)
@@ -168,24 +220,54 @@ class OptimizedDocumentDownloader:
         for tag in soup.find_all('span', class_='mw-editsection'):
             tag.decompose()
         
-        # Ссылки-сноски [1], [2] оставляем — они часть текста; при необходимости можно убрать regex'ом
+        # Удаляем table of contents (содержание)
+        for tag in soup.find_all(id='toc'):
+            tag.decompose()
+        for tag in soup.find_all(class_=lambda c: c and 'toc' in str(c).lower()):
+            tag.decompose()
         
-        # Извлекаем текст с сохранением структуры абзацев
-        for p in soup.find_all('p'):
-            p.append('\n\n')
-        for br in soup.find_all('br'):
-            br.replace_with('\n')
+        # Извлекаем текст только из параграфов и списков (основной контент)
+        paragraphs = []
+        for tag in soup.find_all(['p', 'li']):
+            t = tag.get_text(separator=' ', strip=True)
+            if t and len(t) > 20:  # отсекаем короткие пункты меню
+                paragraphs.append(t)
         
-        text = soup.get_text()
+        if paragraphs:
+            text = '\n\n'.join(paragraphs)
+        else:
+            # fallback: весь текст (separator сохраняет пробелы между элементами)
+            text = soup.get_text(separator=' ')
         
-        # Очищаем: убираем лишние пробелы, сохраняем структуру абзацев
+        # Удаляем всё до "From Wikipedia, the free encyclopedia" (если есть)
+        if 'From Wikipedia, the free encyclopedia' in text:
+            idx = text.find('From Wikipedia, the free encyclopedia')
+            text = text[idx + len('From Wikipedia, the free encyclopedia'):].strip()
+        
+        # Удаляем мусорные фразы в начале строк
+        junk_phrases = [
+            'Jump to content', 'Main menu', 'move to sidebar', 'hide Navigation',
+            'Main page', 'Contents', 'Current events', 'About Wikipedia',
+            'Contact us', 'Contribute', 'Help', 'Learn to edit',
+            'Donate', 'Create account', 'Log in', 'Personal tools',
+            'Toggle the table of contents', 'Edit links', 'Article', 'Talk',
+            'Read', 'Edit', 'View history', 'Tools', 'Actions', 'General',
+            'What links here', 'Related changes', 'Upload file',
+            'Permanent link', 'Page information', 'Cite this page',
+            'Print/export', 'Download as PDF', 'Printable version',
+            'In other projects', 'Appearance', 'move to sidebar hide',
+        ]
         lines = []
         for line in text.splitlines():
             stripped = line.strip()
-            if stripped:
-                lines.append(stripped)
-            elif lines and lines[-1]:
-                lines.append('')
+            if not stripped:
+                if lines and lines[-1]:
+                    lines.append('')
+                continue
+            # Пропускаем строки, которые целиком — мусор
+            if len(stripped) < 30 and any(p in stripped for p in junk_phrases):
+                continue
+            lines.append(stripped)
         
         while lines and not lines[0]:
             lines.pop(0)
@@ -207,18 +289,18 @@ class OptimizedDocumentDownloader:
         
         self.stats['total_requests'] += 1
         
-        # Если это Wikipedia URL, используем API
+        # Wikipedia — только через API (чистый контент без навигации).
+        # Fallback на обычный HTML даёт мусор (меню, sidebar), поэтому не используем.
         if self.is_wikipedia_url(url):
             content = self.download_wikipedia_via_api(url)
             if content:
                 self.document_cache[url_hash] = content
                 self.stats['successful_downloads'] += 1
                 return content
-            else:
-                # Если API не сработал, пробуем обычный способ как fallback
-                logger.debug(f"Wikipedia API не вернул данные для {url}, пробуем обычный способ")
+            self.stats['failed_downloads'] += 1
+            return None
         
-        # Обычная загрузка для не-Wikipedia URL или fallback для Wikipedia
+        # Обычная загрузка для не-Wikipedia URL
         try:
             response = self.session.get(url, timeout=self.timeout)
             response.raise_for_status()
@@ -269,24 +351,108 @@ class OptimizedDocumentDownloader:
             return ""
     
     def _extract_html_text(self, html_content: str) -> str:
-        """Извлекает текст из HTML."""
+        """Извлекает текст из HTML, убирая навигацию и меню."""
+        try:
+            # Сначала trafilatura (оптимизирована для статей), затем BeautifulSoup как fallback
+            try:
+                from trafilatura import extract as trafilatura_extract
+                t_result = trafilatura_extract(html_content)
+                if t_result and len(t_result.strip()) > 200:
+                    return t_result.strip()
+            except ImportError:
+                pass
+            return self._extract_html_text_bs4(html_content)
+        except Exception:
+            return html_content
+    
+    def _extract_html_text_bs4(self, html_content: str) -> str:
+        """Извлечение через BeautifulSoup."""
         try:
             soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Удаляем скрипты и стили
-            for script in soup(["script", "style"]):
-                script.decompose()
+            for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
+                tag.decompose()
             
-            # Получаем текст
-            text = soup.get_text()
+            # Удаляем элементы навигации по классам/id (без header/footer — могут быть article-header)
+            for tag in soup.find_all(class_=lambda c: c and any(
+                x in str(c).lower() for x in (
+                    'nav', 'menu', 'sidebar', 'banner', 'cookie', 'newsletter',
+                    'subscribe', 'social-share'
+                )
+            )):
+                tag.decompose()
+            for tag in soup.find_all(id=lambda i: i and any(
+                x in str(i).lower() for x in ('nav', 'menu', 'sidebar')
+            )):
+                tag.decompose()
             
-            # Очищаем текст
-            lines = (line.strip() for line in text.splitlines())
-            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-            text = ' '.join(chunk for chunk in chunks if chunk)
+            # Пытаемся взять основной контент (не article-header / article-title — только заголовок)
+            def _is_header_like(cls_str: str) -> bool:
+                if not cls_str:
+                    return False
+                c = str(cls_str).lower()
+                return any(x in c for x in ('header', 'title', 'meta', 'byline', 'dateline'))
             
-            return text
-        except Exception as e:
+            def _good_content_class(cls_str: str) -> bool:
+                if not cls_str:
+                    return False
+                c = str(cls_str).lower()
+                if _is_header_like(c):
+                    return False
+                return any(x in c for x in ('article', 'content', 'post', 'story', 'body', 'entry', 'prose'))
+            
+            main = soup.find('article') or soup.find('main') or soup.find(attrs={'role': 'main'})
+            if not main:
+                candidates = soup.find_all(class_=lambda c: c and _good_content_class(c))
+                main = max(candidates, key=lambda t: len(t.get_text())) if candidates else None
+            root = main if main else soup
+            
+            text = root.get_text(separator=' ')
+            
+            # Если выбранный контент слишком короткий (только заголовок) — пробуем body целиком
+            if len(text.strip()) < 400 and root is not soup:
+                body = soup.find('body')
+                if body and len(body.get_text(separator=' ').strip()) > len(text):
+                    root = body
+                    text = root.get_text(separator=' ')
+            
+            # Удаляем типичные мусорные строки из начала
+            junk_patterns = (
+                r'^skip to .+$', r'^log in$', r'^sign (up|in)$', r'^subscribe$',
+                r'^search\s*$', r'^click here to search$', r'^close menu$',
+                r'^explore the .+$', r'^more from .+$', r'^follow us on',
+                r'^home$', r'^news$', r'^sport$', r'^edition\s+(in|us)$',
+                r'^privacy policy$', r'^terms of use$', r'^contact us$',
+                r'^about us$', r'^accessibility$', r'^help$', r'^advertise',
+            )
+            junk_re = re.compile('|'.join(junk_patterns), re.I)
+            
+            lines = []
+            for line in text.splitlines():
+                stripped = ' '.join(line.split())
+                if not stripped:
+                    if lines and lines[-1]:
+                        lines.append('')
+                    continue
+                if len(stripped) < 50 and junk_re.match(stripped):
+                    continue
+                lines.append(stripped)
+            
+            # Обрезаем только явно навигационные короткие строки в начале (не трогаем контент)
+            # Порог 25 символов: "Home", "News", "Search" — нав; "Breaking news: X" (26+) — контент
+            i = 0
+            while i < min(20, len(lines)) and len(lines[i]) < 25:
+                low = lines[i].lower()
+                if low in ('home', 'news', 'search', 'sport', 'log in', 'sign up', 'subscribe',
+                           'menu', 'close menu', 'sign in') or low.startswith('skip to '):
+                    i += 1
+                else:
+                    break
+            if i > 0:
+                lines = lines[i:]
+            
+            return '\n'.join(lines).strip() if lines else ''
+        except Exception:
             return html_content
     
     def download_documents_parallel(self, urls: List[str]) -> List[str]:

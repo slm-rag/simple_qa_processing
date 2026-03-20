@@ -12,6 +12,13 @@
 - **С документами**: `simple_qa_test_set_with_documents.csv` - обогащенный датасет с полем `documents` (тексты скачанных документов)
 - **С long_answer**: `simple_qa_test_set_with_long_answer.csv` - датасет с полем `long_answer` (список релевантных фрагментов из документов)
 
+### google/simpleqa-verified (HuggingFace)
+
+Скрипты для датасета [google/simpleqa-verified](https://huggingface.co/datasets/google/simpleqa-verified) находятся в папке `simpleqa_verified/`:
+
+- `simpleqa_verified/download_documents_verified.py` — загрузка датасета и скачивание документов
+- `simpleqa_verified/run_pipeline.py` — полный пайплайн (документы + long_answer)
+
 ## Возможности
 
 - ✅ Автоматическое скачивание документов по URL
@@ -39,12 +46,15 @@ git clone <repository-url>
 cd simple_qa
 ```
 
-2. Создайте виртуальное окружение:
+2. Создайте виртуальное окружение и установите зависимости:
 ```bash
-python3 -m venv venv
-source venv/bin/activate  # Linux/Mac
-# или
-venv\Scripts\activate  # Windows
+python -m venv env
+# Windows (PowerShell):
+.\env\Scripts\Activate.ps1
+# Windows (cmd):
+env\Scripts\activate.bat
+# Linux/Mac:
+source env/bin/activate
 ```
 
 3. Установите зависимости:
@@ -67,8 +77,6 @@ pip install -r requirements.txt
 metadata,problem,answer
 "{'topic': 'Science', 'urls': ['https://example.com/doc1.pdf', 'https://example.com/doc2.html']}",What is the topic?,Science
 ```
-
-## Использование
 
 ### Базовое использование
 
@@ -118,9 +126,29 @@ input_file = "/path/to/input.csv"
 output_file = "/path/to/output.csv"
 ```
 
+### Обработка google/simpleqa-verified
+
+```bash
+# Полный пайплайн (скачивание + long_answer)
+python simpleqa_verified/run_pipeline.py
+
+# Только скачивание документов
+python simpleqa_verified/download_documents_verified.py
+
+# С ограничением (например, 10 строк для теста)
+python simpleqa_verified/run_pipeline.py -n 10
+
+# Без LLM при извлечении long_answer (быстрее)
+python simpleqa_verified/run_pipeline.py --no-llm
+```
+
+Результаты сохраняются в `simpleqa_verified/`:
+- `simpleqa_verified_with_documents.csv` — документы
+- `simpleqa_verified_with_long_answer.csv` — фрагменты long_answer
+
 ### Извлечение long_answer
 
-Скрипт `extract_long_answer.py` извлекает релевантные фрагменты из документов для каждого вопроса. Требует датасет с полем `documents` (результат `download_documents_full.py`).
+Скрипт `extract_long_answer.py` извлекает релевантные фрагменты из документов для каждого вопроса. Требует датасет с полем `documents` (результат `download_documents_full.py` или `download_documents_verified.py`).
 
 **Логика:**
 - Для документа с совпадением ответа (`answer_found_in_documents`, `answer_found_in_doc_index`, `answer_position_chars`) — извлечение окна/абзаца вокруг позиции ответа
