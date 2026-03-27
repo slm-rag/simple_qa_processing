@@ -18,7 +18,9 @@ def main():
     parser = argparse.ArgumentParser(description='Пайплайн: документы + long_answer для simpleqa-verified')
     parser.add_argument('-n', '--limit', type=int, default=0, help='Ограничить строк (0=все)')
     parser.add_argument('--no-llm', action='store_true', help='Без LLM при извлечении long_answer')
+    parser.add_argument('--model', '-m', default='openai/gpt-4o', help='Модель OpenRouter (по умолчанию: openai/gpt-4o)')
     parser.add_argument('--skip-download', action='store_true', help='Пропустить скачивание (если уже есть)')
+    parser.add_argument('--resume', action='store_true', help='Продолжить извлечение long_answer с последней позиции')
     args = parser.parse_args()
 
     docs_csv = SCRIPT_DIR / 'simpleqa_verified_with_documents.csv'
@@ -47,6 +49,10 @@ def main():
     ]
     if args.no_llm:
         cmd.append('--no-llm')
+    else:
+        cmd.extend(['--model', args.model])
+    if args.resume:
+        cmd.append('--resume')
     if args.limit:
         cmd.extend(['-n', str(args.limit)])
 

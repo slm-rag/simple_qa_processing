@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-Скрипт для анализа статистики датасета simple_qa_test_set_with_long_answer.csv
+Скрипт для анализа статистики датасета с long_answer.
+Поддерживает simple_qa_test_set и simpleqa_verified (колонки urls или metadata).
 """
 
-import pandas as pd
+import argparse
+import csv
 import json
+
+csv.field_size_limit(10**7)
+
+import pandas as pd
 import ast
 import re
 from urllib.parse import urlparse
@@ -77,6 +83,25 @@ def parse_long_answer(long_answer_str: str) -> List[str]:
         return []
     except Exception:
         return []
+
+
+def parse_urls_column(urls_str: str) -> List[str]:
+    """Парсит колонку urls (simpleqa_verified: список или строка через запятую)."""
+    if pd.isna(urls_str) or urls_str == '' or urls_str == '[]':
+        return []
+    try:
+        if isinstance(urls_str, str):
+            urls_str = urls_str.strip()
+            if urls_str.startswith('['):
+                parsed = ast.literal_eval(urls_str) if "'" in urls_str or '"' in urls_str else json.loads(urls_str)
+                return [str(u).strip().rstrip(')') for u in parsed if u and str(u).strip().startswith('http')]
+            urls = re.findall(r'https?://[^\s,\]]+', urls_str)
+            return [u.rstrip(')') for u in urls]
+        if isinstance(urls_str, list):
+            return [str(u).strip().rstrip(')') for u in urls_str if u and str(u).strip().startswith('http')]
+    except Exception:
+        pass
+    return []
 
 
 def parse_metadata(metadata_str: str) -> Dict[str, Any]:
@@ -209,9 +234,11 @@ def analyze_row(row: pd.Series) -> Dict[str, Any]:
     if len(documents) == 0:
         return result
     
-    # Определяем форматы документов и источники (Wikipedia / другие) из metadata
+    # Определяем форматы документов и источники (Wikipedia / другие)
     metadata = parse_metadata(row.get('metadata', ''))
     urls = metadata.get('urls', [])
+    if not urls or not isinstance(urls, list):
+        urls = parse_urls_column(row.get('urls', ''))
     formats = []
     wikipedia_count = 0
     other_count = 0
@@ -248,10 +275,20 @@ def analyze_row(row: pd.Series) -> Dict[str, Any]:
     return result
 
 def main():
-    input_file = '/home/dolganov/simple_qa/simple_qa_test_set_with_long_answer.csv'
-    output_file = '/home/dolganov/simple_qa/simple_qa_test_set_with_long_answer.csv'
-    stats_file = '/home/dolganov/simple_qa/dataset_statistics.txt'
-    
+    parser = argparse.ArgumentParser(description='Анализ статистики датасета с long_answer')
+    parser.add_argument('-i', '--input', default='/home/dolganov/simple_qa/simple_qa_test_set_with_long_answer.csv',
+                        help='Входной CSV')
+    parser.add_argument('-o', '--output', default=None,
+                        help='Обновить датасет колонками статистики (по умолчанию не сохранять)')
+    parser.add_argument('-s', '--stats', default=None,
+                        help='Файл отчёта статистики (по умолчанию: dataset_statistics.txt рядом с входным)')
+    args = parser.parse_args()
+
+    from pathlib import Path
+    input_file = args.input
+    output_file = args.output
+    stats_file = args.stats or str(Path(input_file).parent / 'dataset_statistics.txt')
+
     print(f"Загрузка датасета из {input_file}...")
     # Читаем CSV файл частями для экономии памяти
     chunk_size = 1000
@@ -294,38 +331,33 @@ def main():
                 })
         all_results.extend(chunk_results)
     
-    print("Добавление новых колонок в датасет...")
-    # Перечитываем весь датасет для добавления колонок
-    df = pd.read_csv(input_file)
-    
-    # Удаляем старые колонки статистики, если они есть
-    cols_to_remove = ['num_documents', 'document_formats', 'avg_document_length_words',
-                      'answer_found_in_documents', 'answer_position_words',
-                      'answer_position_chars', 'answer_found_in_doc_index',
-                      'num_long_answer_fragments', 'total_long_answer_words',
-                      'avg_long_answer_fragment_words', 'answer_found_in_long_answer',
-                      'num_documents_from_wikipedia', 'num_documents_from_other']
-    for col in cols_to_remove:
-        if col in df.columns:
-            df = df.drop(columns=[col])
-
-    # Добавляем новые колонки
-    df['num_documents'] = [r['num_documents'] for r in all_results]
-    df['document_formats'] = [','.join(r['document_formats']) if r['document_formats'] else '' for r in all_results]
-    df['avg_document_length_words'] = [r['avg_document_length_words'] for r in all_results]
-    df['answer_found_in_documents'] = [r['answer_found_in_documents'] for r in all_results]
-    df['answer_position_words'] = [r['answer_position_words'] if r['answer_position_words'] is not None else '' for r in all_results]
-    df['answer_position_chars'] = [r['answer_position_chars'] if r['answer_position_chars'] is not None else '' for r in all_results]
-    df['answer_found_in_doc_index'] = [r['answer_found_in_doc_index'] if r['answer_found_in_doc_index'] is not None else '' for r in all_results]
-    df['num_long_answer_fragments'] = [r['num_long_answer_fragments'] for r in all_results]
-    df['total_long_answer_words'] = [r['total_long_answer_words'] for r in all_results]
-    df['avg_long_answer_fragment_words'] = [r['avg_long_answer_fragment_words'] for r in all_results]
-    df['answer_found_in_long_answer'] = [r['answer_found_in_long_answer'] for r in all_results]
-    df['num_documents_from_wikipedia'] = [r['num_documents_from_wikipedia'] for r in all_results]
-    df['num_documents_from_other'] = [r['num_documents_from_other'] for r in all_results]
-    
-    print(f"Сохранение обновленного датасета в {output_file}...")
-    df.to_csv(output_file, index=False)
+    if output_file:
+        print("Добавление новых колонок в датасет...")
+        df = pd.read_csv(input_file)
+        cols_to_remove = ['num_documents', 'document_formats', 'avg_document_length_words',
+                          'answer_found_in_documents', 'answer_position_words',
+                          'answer_position_chars', 'answer_found_in_doc_index',
+                          'num_long_answer_fragments', 'total_long_answer_words',
+                          'avg_long_answer_fragment_words', 'answer_found_in_long_answer',
+                          'num_documents_from_wikipedia', 'num_documents_from_other']
+        for col in cols_to_remove:
+            if col in df.columns:
+                df = df.drop(columns=[col])
+        df['num_documents'] = [r['num_documents'] for r in all_results]
+        df['document_formats'] = [','.join(r['document_formats']) if r['document_formats'] else '' for r in all_results]
+        df['avg_document_length_words'] = [r['avg_document_length_words'] for r in all_results]
+        df['answer_found_in_documents'] = [r['answer_found_in_documents'] for r in all_results]
+        df['answer_position_words'] = [r['answer_position_words'] if r['answer_position_words'] is not None else '' for r in all_results]
+        df['answer_position_chars'] = [r['answer_position_chars'] if r['answer_position_chars'] is not None else '' for r in all_results]
+        df['answer_found_in_doc_index'] = [r['answer_found_in_doc_index'] if r['answer_found_in_doc_index'] is not None else '' for r in all_results]
+        df['num_long_answer_fragments'] = [r['num_long_answer_fragments'] for r in all_results]
+        df['total_long_answer_words'] = [r['total_long_answer_words'] for r in all_results]
+        df['avg_long_answer_fragment_words'] = [r['avg_long_answer_fragment_words'] for r in all_results]
+        df['answer_found_in_long_answer'] = [r['answer_found_in_long_answer'] for r in all_results]
+        df['num_documents_from_wikipedia'] = [r['num_documents_from_wikipedia'] for r in all_results]
+        df['num_documents_from_other'] = [r['num_documents_from_other'] for r in all_results]
+        print(f"Сохранение обновленного датасета в {output_file}...")
+        df.to_csv(output_file, index=False)
     
     # Вычисляем статистику
     print("Вычисление статистики...")
@@ -355,9 +387,9 @@ def main():
     for fmt in all_formats:
         format_counts[fmt] = format_counts.get(fmt, 0) + 1
 
-    # Генерируем отчет
+    dataset_name = Path(input_file).name
     stats_report = f"""
-СТАТИСТИКА ПО ДАТАСЕТУ: simple_qa_test_set_with_long_answer.csv
+СТАТИСТИКА ПО ДАТАСЕТУ: {dataset_name}
 {'='*60}
 
 1. КОЛИЧЕСТВО ДОКУМЕНТОВ НА ВОПРОС:
@@ -424,12 +456,12 @@ def main():
     
     print(stats_report)
     
-    # Сохраняем отчет
     with open(stats_file, 'w', encoding='utf-8') as f:
         f.write(stats_report)
     
     print(f"\nСтатистика сохранена в {stats_file}")
-    print(f"Обновленный датасет сохранен в {output_file}")
+    if output_file:
+        print(f"Обновленный датасет сохранен в {output_file}")
 
 if __name__ == '__main__':
     main()

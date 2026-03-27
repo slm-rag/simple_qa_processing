@@ -5,13 +5,17 @@
 - Для документа с ответом: окно вокруг позиции ответа (вариант 1)
 - Для остальных документов: разбивка на чанки + BM25 + выбор через LLM (вариант 2)
 - long_answer — список уникальных фрагментов (без дубликатов после нормализации)
+
+LLM: OpenRouter API (openai/gpt-4o по умолчанию). Требуется OPENROUTER_API_KEY.
 """
 
-import csv
-import ast
-import json
-import re
 import argparse
+import ast
+import csv
+import json
+import os
+import re
+import sys
 from typing import List, Optional, Tuple
 
 # Увеличиваем лимит размера поля CSV
@@ -27,9 +31,10 @@ MAX_PARAGRAPH_WORDS = 600  # абзац больше — считаем "сли�
 MIN_PARAGRAPHS = 2  # минимум абзацев, чтобы использовать разбивку по абзацам
 ADJACENT_PARAGRAPHS = 1  # соседних абзацев с каждой стороны для контекста (1 = до 3 абзацев)
 MAX_EXPANDED_WORDS = 500  # макс. слов при расширении контекстом
-# Qwen2.5-7B-Instruct: совместим с Python 3.8 и transformers 4.37+
-# Qwen3-8B требует transformers>=4.51 и Python>=3.9
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+
+# OpenRouter: сильная модель OpenAI
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "openai/gpt-4o"
 
 
 def parse_documents(documents_str: str) -> List[str]:
@@ -271,82 +276,21 @@ def get_paragraph_containing_position(text: str, pos_chars: int) -> Optional[str
     return paragraphs[-1] if paragraphs else None
 
 
-def load_llm():
-    """Загружает модель и токенизатор."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    import torch
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto",
-        trust_remote_code=True
-    )
-    return tokenizer, model
-
-
-def llm_verify_paragraph(
-    tokenizer,
-    model,
-    question: str,
-    answer: str,
-    paragraph: str,
-    enable_thinking: bool = False
-) -> bool:
-    """
-    Спрашивает LLM: содержит ли абзац ответ на вопрос?
-    Возвращает True если LLM считает, что да.
-    """
-    prompt = f"""Text:
-{paragraph[:2000]}
-
-Question: {question}
-Expected short answer: {answer}
-
-Does the text above contain this answer in explicit or implicit form? Reply with only one word: Yes or No."""
-
-    messages = [{"role": "user", "content": prompt}]
-    try:
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=enable_thinking
-        )
-    except TypeError:
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-    import torch
-    inputs = tokenizer(text, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        out = model.generate(
-            **inputs,
-            max_new_tokens=32,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-    response = tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
-    return 'да' in response.lower() or 'yes' in response.lower()
-
-
-def llm_pick_best_chunk(
-    tokenizer,
-    model,
+def openrouter_pick_best_chunk(
+    api_key: str,
     question: str,
     answer: str,
     chunks: List[str],
-    enable_thinking: bool = False
+    model: str = OPENROUTER_MODEL,
 ) -> int:
     """
-    Просит LLM выбрать номер чанка (1-based), который содержит ответ.
+    Просит LLM (OpenRouter) выбрать номер чанка (1-based), который содержит ответ.
     Возвращает индекс (0-based) или -1 если ни один не подходит.
     """
     if not chunks:
         return -1
+    import requests
+
     formatted = "\n\n".join(f"[{i+1}]\n{c[:1500]}" for i, c in enumerate(chunks[:MAX_CHUNKS_FOR_LLM]))
     prompt = f"""Question: {question}
 Expected short answer: {answer}
@@ -354,34 +298,52 @@ Expected short answer: {answer}
 Text fragments:
 {formatted}
 
-Which fragment [1], [2], ... contains the answer to the question? Reply with only the number (1, 2, 3...) or 0 if none."""
+Which fragment [1], [2], ... contains the answer? The fragment must be actual content (not metadata, navigation, title page, or table of contents). Reply with only the number (1, 2, 3...) or 0 if none contain the answer."""
 
-    messages = [{"role": "user", "content": prompt}]
-    try:
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=enable_thinking
-        )
-    except TypeError:
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-    import torch
-    inputs = tokenizer(text, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        out = model.generate(
-            **inputs,
-            max_new_tokens=16,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-    response = tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
-    # Извлекаем число
-    numbers = re.findall(r'\b(\d+)\b', response)
+    import time
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/simple_qa",
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 16,
+        "temperature": 0,
+    }
+    resp = None
+    for attempt in range(4):
+        try:
+            resp = requests.post(
+                OPENROUTER_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            break
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+            else:
+                raise
+        except requests.exceptions.HTTPError as e:
+            r = getattr(e, 'response', None)
+            status = r.status_code if r is not None else 0
+            if status in (429, 502, 503, 504) and attempt < 3:
+                time.sleep(2 ** attempt)
+            elif status in (429, 502, 503, 504):
+                raise
+            else:
+                # 400 и др. — не ретраим, возвращаем fallback (ни один фрагмент)
+                err_body = (r.text[:500] if r is not None else str(e))
+                print(f"\nOpenRouter HTTP {status}: {err_body}", file=sys.stderr)
+                return -1
+    data = resp.json()
+    content = (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+
+    numbers = re.findall(r'\b(\d+)\b', content)
     if numbers:
         n = int(numbers[0])
         if 1 <= n <= len(chunks):
@@ -407,12 +369,11 @@ def _get_fragment_variant2(
     doc: str,
     question: str,
     answer: str,
-    tokenizer,
-    model,
+    api_key: Optional[str],
     use_llm: bool,
-    enable_thinking: bool,
+    model: str = OPENROUTER_MODEL,
 ) -> str:
-    """Вариант 2: BM25 + LLM для документа без явного совпадения."""
+    """Вариант 2: BM25 + LLM (OpenRouter) для документа без явного совпадения."""
     doc_segments = get_segments(doc)
     if not doc_segments:
         return ''
@@ -430,11 +391,11 @@ def _get_fragment_variant2(
         if not candidates and answer:
             candidates = [s for s in extended if answer.lower() in s.lower()]
     segments_for_pick = candidates if candidates else top_segments
-    if use_llm and tokenizer is not None and model is not None:
-        best_idx = llm_pick_best_chunk(
-            tokenizer, model, question, answer, segments_for_pick, enable_thinking
+    if use_llm and api_key:
+        best_idx = openrouter_pick_best_chunk(
+            api_key, question, answer, segments_for_pick, model=model
         )
-        best = segments_for_pick[best_idx] if best_idx >= 0 else segments_for_pick[0]
+        best = segments_for_pick[best_idx] if best_idx >= 0 else ''
     else:
         best = segments_for_pick[0] if segments_for_pick else ''
     if best:
@@ -444,10 +405,9 @@ def _get_fragment_variant2(
 
 def process_row(
     row: dict,
-    tokenizer,
-    model,
+    api_key: Optional[str],
     use_llm: bool = True,
-    enable_thinking: bool = False
+    model: str = OPENROUTER_MODEL,
 ) -> List[str]:
     """
     Обрабатывает одну строку. Для каждого документа находит релевантный фрагмент.
@@ -469,7 +429,7 @@ def process_row(
             candidate = _get_fragment_variant1(doc, answer, pos_int)
         else:
             candidate = _get_fragment_variant2(
-                doc, question, answer, tokenizer, model, use_llm, enable_thinking
+                doc, question, answer, api_key, use_llm, model=model
             )
 
         if candidate and candidate.strip() and not is_likely_junk(candidate, answer):
@@ -496,9 +456,9 @@ def main():
         help='Не использовать LLM (только извлечение по позиции/первый чанк)'
     )
     parser.add_argument(
-        '--thinking',
-        action='store_true',
-        help='Включить режим рассуждений у Qwen3 (медленнее, но точнее)'
+        '--model', '-m',
+        default=OPENROUTER_MODEL,
+        help=f'Модель OpenRouter (по умолчанию: {OPENROUTER_MODEL})'
     )
     parser.add_argument(
         '--limit', '-n',
@@ -506,13 +466,26 @@ def main():
         default=0,
         help='Ограничить количество обрабатываемых строк (0 = все)'
     )
+    parser.add_argument(
+        '--resume',
+        action='store_true',
+        help='Продолжить с последней сохранённой позиции (читает output, пропускает обработанные)'
+    )
+    parser.add_argument(
+        '--save-every',
+        type=int,
+        default=50,
+        help='Сохранять прогресс каждые N строк (по умолчанию 50)'
+    )
     args = parser.parse_args()
 
-    tokenizer, model = None, None
+    api_key = None
     if not args.no_llm:
-        print(f'Загрузка модели {MODEL_NAME}...')
-        tokenizer, model = load_llm()
-        print('Модель загружена.')
+        api_key = os.environ.get('OPENROUTER_API_KEY')
+        if not api_key:
+            print('Ошибка: для LLM нужен OPENROUTER_API_KEY. Установите переменную окружения или используйте --no-llm.')
+            sys.exit(1)
+        print(f'Используется OpenRouter: {args.model}')
 
     print(f'Чтение {args.input}...')
     rows = []
@@ -522,17 +495,49 @@ def main():
         if 'long_answer' not in fieldnames:
             fieldnames.append('long_answer')
         for row in reader:
+            row.setdefault('long_answer', '[]')
             rows.append(row)
             if args.limit and len(rows) >= args.limit:
                 break
+
+    skip_count = 0
+    if args.resume and os.path.exists(args.output):
+        with open(args.output, 'r', encoding='utf-8') as f:
+            resume_rows = list(csv.DictReader(f))
+        skip_count = len(resume_rows)
+        if skip_count > 0:
+            for i, r in enumerate(resume_rows):
+                if i < len(rows):
+                    rows[i]['long_answer'] = r.get('long_answer', '[]')
+            print(f'Resume: пропуск {skip_count} уже обработанных строк')
+            if skip_count >= len(rows):
+                print('Все строки уже обработаны. Для перезапуска удалите выходной файл или запустите без --resume.')
+                with open(args.output, 'w', encoding='utf-8', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                filled = sum(1 for r in rows if json.loads(r.get('long_answer', '[]')))
+                print(f'Готово. Заполнено long_answer: {filled}/{len(rows)}')
+                sys.exit(0)
 
     total = len(rows)
     print(f'Обработка {total} строк...')
 
     from tqdm import tqdm
-    for row in tqdm(rows, desc='Извлечение long_answer'):
-        fragments = process_row(row, tokenizer, model, use_llm=not args.no_llm, enable_thinking=args.thinking)
+    save_every = max(1, args.save_every)
+    for i, row in enumerate(tqdm(rows, desc='Извлечение long_answer')):
+        if i < skip_count:
+            continue
+        fragments = process_row(
+            row, api_key, use_llm=not args.no_llm, model=args.model
+        )
         row['long_answer'] = json.dumps(fragments, ensure_ascii=False)
+        if (i + 1) % save_every == 0:
+            with open(args.output, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL)
+                writer.writeheader()
+                writer.writerows(rows[: i + 1])
+            tqdm.write(f'Сохранено {i + 1}/{total}')
 
     print(f'Сохранение в {args.output}...')
     with open(args.output, 'w', encoding='utf-8', newline='') as f:

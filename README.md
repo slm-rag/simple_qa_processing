@@ -36,7 +36,7 @@
 
 - Python 3.8+
 - Для скачивания документов: `pandas`, `requests`, `beautifulsoup4`, `PyPDF2`, `tqdm`
-- Для извлечения long_answer: `torch`, `transformers`, `accelerate`, `rank-bm25` (см. `requirements.txt`)
+- Для извлечения long_answer: `rank-bm25`, OpenRouter API (переменная `OPENROUTER_API_KEY`)
 
 ## Установка
 
@@ -151,17 +151,19 @@ python simpleqa_verified/run_pipeline.py --no-llm
 Скрипт `extract_long_answer.py` извлекает релевантные фрагменты из документов для каждого вопроса. Требует датасет с полем `documents` (результат `download_documents_full.py` или `download_documents_verified.py`).
 
 **Логика:**
-- Для документа с совпадением ответа (`answer_found_in_documents`, `answer_found_in_doc_index`, `answer_position_chars`) — извлечение окна/абзаца вокруг позиции ответа
-- Для остальных документов — разбивка на сегменты, BM25-ранжирование, выбор лучшего чанка через LLM (Qwen2.5-7B-Instruct)
+- Для документа с совпадением ответа — извлечение окна/абзаца вокруг позиции ответа
+- Для остальных документов — разбивка на сегменты, BM25-ранжирование, выбор лучшего чанка через LLM (OpenRouter, по умолчанию `openai/gpt-4o`)
 - Результат — список уникальных фрагментов (дубликаты после нормализации удаляются)
 
 ```bash
+# Требуется OPENROUTER_API_KEY (получить на https://openrouter.ai)
+export OPENROUTER_API_KEY=sk-or-...
 python extract_long_answer.py -i simple_qa_test_set_with_documents.csv -o simple_qa_test_set_with_long_answer.csv
 ```
 
 Опции:
 - `--no-llm` — без LLM (только BM25, первый чанк)
-- `--thinking` — режим рассуждений (медленнее, точнее)
+- `--model` — модель OpenRouter (по умолчанию: openai/gpt-4o)
 - `-n N` — обработать только N строк
 
 Поле `long_answer` сохраняется как JSON-список строк: `["фрагмент 1", "фрагмент 2"]`.
