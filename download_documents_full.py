@@ -8,7 +8,7 @@ import requests
 import time
 import json
 import re
-from urllib.parse import urlparse, unquote
+from urllib.parse import parse_qs, urlparse, unquote
 from bs4 import BeautifulSoup
 import PyPDF2
 import io
@@ -58,44 +58,69 @@ class OptimizedDocumentDownloader:
     def get_url_hash(self, url: str) -> str:
         """Создает хэш URL для кэширования."""
         return hashlib.md5(url.encode()).hexdigest()
-    
-    def is_wikipedia_url(self, url: str) -> bool:
-        """Проверяет, является ли URL ссылкой на Wikipedia."""
+
+    @staticmethod
+    def _normalize_wikipedia_host(url: str) -> str:
+        """Возвращает нормализованный хост *.wikipedia.org или пустую строку."""
         try:
-            parsed = urlparse(url)
-            hostname = parsed.netloc.lower()
-            # Проверяем различные домены Wikipedia
-            wikipedia_domains = [
-                'en.wikipedia.org',
-                'ru.wikipedia.org',
-                'de.wikipedia.org',
-                'fr.wikipedia.org',
-                'es.wikipedia.org',
-                'it.wikipedia.org',
-                'ja.wikipedia.org',
-                'zh.wikipedia.org',
-                'pt.wikipedia.org',
-                'pl.wikipedia.org',
-                'www.wikipedia.org'
-            ]
-            return any(hostname.endswith(domain) for domain in wikipedia_domains) and '/wiki/' in parsed.path
-        except:
+            host = (urlparse((url or "").strip()).netloc or "").lower()
+            if not host:
+                return ""
+            if host.startswith("www."):
+                host = host[4:]
+            if ".m.wikipedia.org" in host:
+                host = host.replace(".m.wikipedia.org", ".wikipedia.org")
+            if host.endswith(".wikipedia.org") or host == "wikipedia.org":
+                return host
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _wikipedia_lang_from_hostname(hostname: str) -> str:
+        """Код языка для wikipedia-api / api.php (например uk, zh-min-nan, en)."""
+        host = (hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if ".m.wikipedia.org" in host:
+            host = host.replace(".m.wikipedia.org", ".wikipedia.org")
+        if not host.endswith(".wikipedia.org"):
+            return "en"
+        sub = host[: -len(".wikipedia.org")]
+        return sub if sub else "en"
+
+    def is_wikipedia_url(self, url: str) -> bool:
+        """
+        Страница статьи на Wikipedia: хост *.wikipedia.org и из URL можно взять title
+        (/wiki/... или index.php?title=...). Остальное уходит в обычную HTML-загрузку.
+        """
+        if not self._normalize_wikipedia_host(url):
             return False
-    
+        try:
+            parsed = urlparse((url or "").strip())
+            path = parsed.path or ""
+            query_l = (parsed.query or "").lower()
+            if "/wiki/" in path:
+                return True
+            if "index.php" in path and "title=" in query_l:
+                return True
+            return False
+        except Exception:
+            return False
+
     def extract_wikipedia_title(self, url: str) -> Optional[str]:
         """Извлекает название статьи из Wikipedia URL."""
         try:
             parsed = urlparse(url)
-            if '/wiki/' in parsed.path:
-                # Извлекаем часть после /wiki/
-                title = parsed.path.split('/wiki/')[-1]
-                # Удаляем якоря (#section)
-                title = title.split('#')[0]
-                # Декодируем URL-кодирование
-                title = unquote(title)
-                return title
+            if "/wiki/" in parsed.path:
+                title = parsed.path.split("/wiki/")[-1]
+                title = title.split("#")[0]
+                return unquote(title)
+            qs = parse_qs(parsed.query)
+            if "title" in qs and qs["title"]:
+                return unquote(qs["title"][0])
             return None
-        except:
+        except Exception:
             return None
     
     def _get_wikipedia_wiki(self, lang: str):
@@ -118,11 +143,8 @@ class OptimizedDocumentDownloader:
                 return None
             
             parsed = urlparse(url)
-            hostname = parsed.netloc.lower()
-            lang = 'en'
-            if '.wikipedia.org' in hostname:
-                lang = hostname.split('.')[0]
-            
+            lang = self._wikipedia_lang_from_hostname(parsed.netloc)
+
             self.stats['wikipedia_api_requests'] += 1
             wiki = self._get_wikipedia_wiki(lang)
             page = wiki.page(title)
@@ -152,10 +174,7 @@ class OptimizedDocumentDownloader:
             if not title:
                 return None
             parsed = urlparse(url)
-            hostname = parsed.netloc.lower()
-            lang = 'en'
-            if '.wikipedia.org' in hostname:
-                lang = hostname.split('.')[0]
+            lang = self._wikipedia_lang_from_hostname(parsed.netloc)
             api_url = f"https://{lang}.wikipedia.org/w/api.php"
             params = {
                 'action': 'parse', 'page': title, 'prop': 'text', 'format': 'json',
@@ -457,10 +476,9 @@ class OptimizedDocumentDownloader:
     
     def download_documents_parallel(self, urls: List[str]) -> List[str]:
         """
-        Скачивает документы параллельно.
+        Скачивает документы параллельно, сохраняя порядок как в списке urls
+        (индекс i соответствует clean_urls[i]).
         """
-        documents = []
-        
         # Фильтруем и очищаем URL
         clean_urls = []
         for url in urls:
@@ -469,31 +487,30 @@ class OptimizedDocumentDownloader:
             url = url.strip()
             if url.startswith('http'):
                 clean_urls.append(url)
-        
+
         if not clean_urls:
-            return documents
-        
-        # Скачиваем параллельно
+            return []
+
+        documents: List[str] = [''] * len(clean_urls)
+
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Создаем задачи
-            future_to_url = {
-                executor.submit(self.download_document, url): url 
-                for url in clean_urls
+            future_to_index = {
+                executor.submit(self.download_document, url): i
+                for i, url in enumerate(clean_urls)
             }
-            
-            # Собираем результаты
-            for future in as_completed(future_to_url):
-                url = future_to_url[future]
+
+            for future in as_completed(future_to_index):
+                i = future_to_index[future]
+                url = clean_urls[i]
                 try:
                     doc_content = future.result()
-                    if doc_content:
-                        documents.append(doc_content)
+                    documents[i] = doc_content.strip() if doc_content else ''
                 except Exception as e:
                     logger.warning(f"Ошибка при обработке {url}: {e}")
-                
-                # Небольшая задержка между запросами
+                    documents[i] = ''
+
                 time.sleep(self.delay)
-        
+
         return documents
 
 def signal_handler(sig, frame):
@@ -601,11 +618,26 @@ def process_dataset_full(input_file: str, output_file: str):
     logger.info(f"Wikipedia API успешных: {downloader.stats['wikipedia_api_success']}")
     
     # Сохраняем итоговый отчет
-    save_final_report(total_rows, successful_downloads, failed_downloads, downloader.stats, output_file)
+    save_final_report(
+        total_rows,
+        successful_downloads,
+        failed_downloads,
+        downloader.stats,
+        output_file,
+        input_file=input_file,
+    )
     
     return failed_downloads
 
-def save_final_report(total_rows, successful_downloads, failed_downloads, stats, output_file):
+def save_final_report(
+    total_rows,
+    successful_downloads,
+    failed_downloads,
+    stats,
+    output_file,
+    *,
+    input_file: Optional[str] = None,
+):
     """
     Сохраняет итоговый отчет о результатах обработки.
     """
@@ -617,7 +649,7 @@ def save_final_report(total_rows, successful_downloads, failed_downloads, stats,
         f.write("=" * 60 + "\n\n")
         
         f.write(f"Дата и время завершения: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Исходный файл: simple_qa_test_set.csv\n")
+        f.write(f"Исходный файл: {os.path.basename(input_file) if input_file else '—'}\n")
         f.write(f"Результирующий файл: {os.path.basename(output_file)}\n\n")
         
         f.write("ОБЩАЯ СТАТИСТИКА:\n")
@@ -665,10 +697,3 @@ def save_final_report(total_rows, successful_downloads, failed_downloads, stats,
     
     logger.info(f"Итоговый отчет сохранен в: {report_file}")
 
-if __name__ == "__main__":
-    input_file = "/home/dolganov/simple_qa/simple_qa_test_set.csv"
-    output_file = "/home/dolganov/simple_qa/simple_qa_test_set_with_documents.csv"
-    
-    failed_count = process_dataset_full(input_file, output_file)
-    print(f"\nИтоговая статистика:")
-    print(f"Количество примеров с недоступными документами: {failed_count}")

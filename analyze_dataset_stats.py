@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Скрипт для анализа статистики датасета с long_answer.
-Поддерживает simple_qa_test_set и simpleqa_verified (колонки urls или metadata).
+Скрипт для анализа статистики датасета с long_answer (simpleqa_verified и аналогичные CSV).
 """
 
 import argparse
@@ -13,6 +12,7 @@ csv.field_size_limit(10**7)
 import pandas as pd
 import ast
 import re
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
@@ -124,42 +124,129 @@ def parse_metadata(metadata_str: str) -> Dict[str, Any]:
         return {'urls': []}
 
 def is_wikipedia_url(url: str) -> bool:
-    """Проверяет, является ли URL ссылкой на Wikipedia."""
+    """
+    Wikipedia по URL: хост — поддомен wikipedia.org (не смотрим путь).
+
+    Нормализуем www. и мобильный *.m.wikipedia.org. Подстрока «wikipedia» во всём URL
+    не используется — избегаем ложных срабатываний (evilwikipedia.org, путь /wiki/...).
+    """
     try:
-        parsed = urlparse(url)
-        hostname = parsed.netloc.lower()
-        wikipedia_domains = [
-            'en.wikipedia.org', 'ru.wikipedia.org', 'de.wikipedia.org',
-            'fr.wikipedia.org', 'es.wikipedia.org', 'it.wikipedia.org',
-            'ja.wikipedia.org', 'zh.wikipedia.org', 'pt.wikipedia.org',
-            'pl.wikipedia.org', 'www.wikipedia.org'
-        ]
-        return any(hostname.endswith(d) for d in wikipedia_domains) and '/wiki/' in parsed.path
+        host = (urlparse((url or "").strip()).netloc or "").lower()
+        if not host:
+            return False
+        if host.startswith("www."):
+            host = host[4:]
+        if ".m.wikipedia.org" in host:
+            host = host.replace(".m.wikipedia.org", ".wikipedia.org")
+        return host.endswith(".wikipedia.org") or host == "wikipedia.org"
     except Exception:
         return False
 
 
+# Метка по URL (без Content-Type). Непопавшие в таблицу расширения → ext_<suffix>
+def _build_extension_format_map() -> Dict[str, str]:
+    m: Dict[str, str] = {}
+
+    def add(fmt: str, extensions: List[str]) -> None:
+        for e in extensions:
+            e = e if e.startswith('.') else f'.{e}'
+            m[e.lower()] = fmt
+
+    add('pdf', ['pdf'])
+    add('html', ['html', 'htm', 'xhtml', 'shtml', 'mhtml', 'mht'])
+    add('txt', ['txt', 'text', 'log', 'nfo'])
+    add('markdown', ['md', 'markdown', 'mdown', 'mkd'])
+    add('rtf', ['rtf'])
+    add('office_word', ['doc', 'docx', 'docm', 'dot', 'dotx', 'odt', 'ott', 'wps'])
+    add('office_sheet', ['xls', 'xlsx', 'xlsm', 'xlsb', 'ods', 'ots', 'numbers'])
+    add('csv', ['csv', 'tsv'])
+    add('office_slides', ['ppt', 'pptx', 'pps', 'ppsx', 'potx', 'odp', 'otp'])
+    add('ebook', ['epub', 'mobi', 'azw', 'azw3'])
+    add('image', [
+        'png', 'jpg', 'jpeg', 'jpe', 'gif', 'webp', 'bmp', 'tif', 'tiff',
+        'avif', 'heic', 'heif', 'ico', 'raw', 'cr2', 'nef', 'dng', 'orf',
+        'svg',
+    ])
+    add('audio', ['mp3', 'wav', 'ogg', 'oga', 'opus', 'flac', 'm4a', 'aac', 'wma', 'mid', 'midi'])
+    add('video', ['mp4', 'm4v', 'webm', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'mpg', 'mpeg', 'ts', 'm2ts', '3gp'])
+    add('archive', [
+        'zip', 'rar', '7z', 'tar', 'gz', 'gzip', 'tgz', 'bz2', 'tbz2', 'xz', 'txz',
+        'lz', 'lzma', 'zst', 'cab', 'dmg', 'iso',
+    ])
+    add('data_json', ['json', 'jsonl', 'ndjson'])
+    add('data_xml', ['xml', 'xsd', 'xsl', 'xslt', 'rss', 'atom'])
+    add('data_yaml', ['yaml', 'yml'])
+    add('data_toml', ['toml'])
+    add('ini_config', ['ini', 'cfg', 'conf', 'config', 'properties'])
+    add('sql', ['sql'])
+    add('sqlite', ['sqlite', 'sqlite3', 'db'])
+    add('latex', ['tex', 'bib', 'cls', 'sty'])
+    add('geo', ['kml', 'gpx', 'geojson'])
+    add('calendar', ['ics', 'ical', 'icalendar'])
+    add('cert', ['pem', 'crt', 'cer', 'key', 'p12', 'pfx', 'der'])
+    add('font', ['woff', 'woff2', 'ttf', 'otf', 'eot'])
+    add('web_asset', ['css', 'less', 'scss', 'sass', 'wasm', 'map'])
+    add('code', [
+        'py', 'pyw', 'pyi', 'pyx', 'pxd', 'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'vue',
+        'java', 'class', 'jar', 'war', 'c', 'cc', 'cxx', 'cpp', 'h', 'hpp', 'hxx',
+        'rs', 'go', 'rb', 'r', 'swift', 'kt', 'kts', 'scala', 'clj',
+        'hs', 'lhs', 'sh', 'bash', 'zsh', 'fish', 'ps1', 'bat', 'cmd', 'lua', 'vim',
+        'cmake', 'make', 'mk', 'dockerfile', 'pl', 'pm',
+    ])
+    add('binary_app', ['exe', 'msi', 'app', 'deb', 'rpm', 'dll', 'so', 'dylib', 'o', 'a'])
+    add('disk_image', ['img', 'vmdk', 'vdi', 'qcow2'])
+    add('backup', ['bak', 'old', 'orig', 'tmp', 'temp', 'swp'])
+    return m
+
+
+_EXTENSION_FORMAT_MAP = _build_extension_format_map()
+
+_HTML_PAGE_SUFFIXES = frozenset({
+    '.php', '.asp', '.aspx', '.jsp', '.cgi', '.fcgi',  # как правило HTML в выдаче
+})
+
+
 def get_document_format(url: str) -> str:
-    """Определяет формат документа по URL."""
-    url_lower = url.lower()
-    if url_lower.endswith('.pdf'):
+    """
+    Категория по URL (эвристика, не MIME). Пустой путь без суффикса и Wikipedia → html.
+    Расширение не из таблицы → ext_<суффикс> (например ext_eps).
+    """
+    if not url or not str(url).strip().startswith('http'):
+        return 'unknown'
+    parsed = urlparse(url)
+    if not parsed.netloc:
+        return 'unknown'
+
+    path_raw = parsed.path or '/'
+    base = url.split('?')[0].split('#')[0].lower()
+
+    if base.endswith('.pdf'):
         return 'pdf'
-    elif url_lower.endswith(('.html', '.htm')):
+    if base.endswith(('.html', '.htm', '.xhtml', '.shtml', '.mhtml', '.mht')):
         return 'html'
-    elif url_lower.endswith('.txt'):
+    if base.endswith('.txt'):
         return 'txt'
-    else:
-        # Пытаемся определить по домену или пути
-        parsed = urlparse(url)
-        path = parsed.path.lower()
-        if '.pdf' in path:
-            return 'pdf'
-        elif '.html' in path or '.htm' in path:
-            return 'html'
-        elif '.txt' in path:
-            return 'txt'
-        else:
-            return 'unknown'
+
+    if is_wikipedia_url(url):
+        return 'html'
+
+    suf = PurePosixPath(path_raw).suffix.lower()
+    if path_raw.lower().rstrip('/').endswith('.pdf'):
+        return 'pdf'
+
+    if suf in _HTML_PAGE_SUFFIXES:
+        return 'html'
+    if suf in _EXTENSION_FORMAT_MAP:
+        return _EXTENSION_FORMAT_MAP[suf]
+
+    if suf in ('.htm', '.html', '.xhtml', '.shtml', '.mhtml', '.mht'):
+        return 'html'
+    if suf == '':
+        return 'html'
+
+    tail = suf.lstrip('.') or ''
+    safe = ''.join(c if c.isalnum() else '_' for c in tail)
+    return f'ext_{safe}' if safe else 'unknown'
 
 def count_words(text: str) -> int:
     """Подсчитывает количество слов в тексте."""
@@ -276,15 +363,19 @@ def analyze_row(row: pd.Series) -> Dict[str, Any]:
 
 def main():
     parser = argparse.ArgumentParser(description='Анализ статистики датасета с long_answer')
-    parser.add_argument('-i', '--input', default='/home/dolganov/simple_qa/simple_qa_test_set_with_long_answer.csv',
-                        help='Входной CSV')
+    _root = Path(__file__).resolve().parent
+    parser.add_argument(
+        '-i',
+        '--input',
+        default=str(_root / 'simpleqa_verified' / 'simpleqa_verified_with_long_answer.csv'),
+        help='Входной CSV',
+    )
     parser.add_argument('-o', '--output', default=None,
                         help='Обновить датасет колонками статистики (по умолчанию не сохранять)')
     parser.add_argument('-s', '--stats', default=None,
                         help='Файл отчёта статистики (по умолчанию: dataset_statistics.txt рядом с входным)')
     args = parser.parse_args()
 
-    from pathlib import Path
     input_file = args.input
     output_file = args.output
     stats_file = args.stats or str(Path(input_file).parent / 'dataset_statistics.txt')
@@ -303,17 +394,18 @@ def main():
     print(f"Всего строк: {total_rows}")
     print("Обработка датасета...")
     
-    # Читаем и обрабатываем по частям
+    # Читаем и обрабатываем по частям (глобальный индекс строки данных — не pandas idx внутри чанка)
+    global_row_index = 0
     for chunk in tqdm(pd.read_csv(input_file, chunksize=chunk_size), 
                           total=(total_rows // chunk_size + 1), 
                           desc="Обработка"):
         chunk_results = []
-        for idx, row in chunk.iterrows():
+        for _, row in chunk.iterrows():
             try:
                 analysis = analyze_row(row)
                 chunk_results.append(analysis)
             except Exception as e:
-                print(f"Ошибка при обработке строки {idx}: {e}")
+                print(f"Ошибка при обработке строки данных с индексом {global_row_index}: {e}")
                 chunk_results.append({
                     'num_documents': 0,
                     'document_formats': [],
@@ -329,6 +421,7 @@ def main():
                     'num_documents_from_wikipedia': 0,
                     'num_documents_from_other': 0,
                 })
+            global_row_index += 1
         all_results.extend(chunk_results)
     
     if output_file:
@@ -379,6 +472,23 @@ def main():
     avg_frag_lengths = [r['avg_long_answer_fragment_words'] for r in all_results if r['avg_long_answer_fragment_words'] > 0]
     answer_in_long_answer_count = sum(1 for r in all_results if r['answer_found_in_long_answer'])
 
+    indices_without_docs = [i for i, r in enumerate(all_results) if r['num_documents'] == 0]
+    _max_idx_show = 200
+    if indices_without_docs:
+        shown = indices_without_docs[:_max_idx_show]
+        pair_lines = ', '.join(f"{i}→{i + 2}" for i in shown)
+        overflow = (
+            f"\n   … всего {len(indices_without_docs)} позиций; показано первых {_max_idx_show} (формат: idx→строка_CSV)"
+            if len(indices_without_docs) > _max_idx_show
+            else ""
+        )
+        section2_indices = f"""
+   Список: 0-based индекс строки данных → номер строки в CSV-файле (1-based; строка 1 = заголовок).
+   {pair_lines}{overflow}
+"""
+    else:
+        section2_indices = "\n   (ни у одной строки колонка documents не пуста)\n"
+
     # Статистика по форматам
     all_formats = []
     for r in all_results:
@@ -400,8 +510,7 @@ def main():
    Стандартное отклонение: {statistics.stdev(num_docs_list) if len(num_docs_list) > 1 else 0:.2f}
 
 2. КОЛИЧЕСТВО ВОПРОСОВ БЕЗ ДОКУМЕНТОВ: {questions_without_docs}
-   Процент от общего числа: {questions_without_docs / len(all_results) * 100:.2f}%
-
+   Процент от общего числа: {questions_without_docs / len(all_results) * 100:.2f}%{section2_indices}
 3. СРЕДНЯЯ ДЛИНА ДОКУМЕНТА В СЛОВАХ:
    Среднее: {statistics.mean(avg_doc_lengths) if avg_doc_lengths else 0:.2f}
    Медиана: {statistics.median(avg_doc_lengths) if avg_doc_lengths else 0:.2f}
@@ -435,7 +544,11 @@ def main():
    Ответ найден в long_answer: {answer_in_long_answer_count}
    Процент от общего числа: {answer_in_long_answer_count / len(all_results) * 100:.2f}%
 
-6. ФОРМАТЫ ДОКУМЕНТОВ:
+6. ФОРМАТЫ ДОКУМЕНТОВ (по URL; без Content-Type):
+   html — страница без суффикса, Wikipedia, .php/.asp/.jsp/…; pdf/txt — документы;
+   office_* / csv / ebook; image/audio/video; archive; data_json/xml/yaml/toml;
+   ini_config; sql/sqlite; code/web_asset/font/latex/geo/calendar/cert/binary_app/disk_image/backup;
+   ext_<суффикс> — любое иное явное расширение в пути; unknown — не HTTP/без хоста.
 """
     for fmt, count in sorted(format_counts.items(), key=lambda x: -x[1]):
         stats_report += f"   {fmt}: {count} ({count / len(all_formats) * 100:.2f}%)\n"

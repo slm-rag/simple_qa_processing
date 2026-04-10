@@ -1,10 +1,8 @@
-# Большие датасеты с документами
-simple_qa_test_set_with_documents.csv
-simple_qa_test_set_with_documents*.csv
-simple_qa_test_set.csv
-simple_qa_test_set_with_long_answer.csv
+# Большие датасеты с документами (simpleqa_verified)
 simpleqa_verified/simpleqa_verified_with_documents.csv
 simpleqa_verified/simpleqa_verified_with_long_answer.csv
+simpleqa_verified/*.jsonl
+simpleqa_verified/*statistics*.txt
 *.csv.temp
 
 # Логи
@@ -58,3 +56,4 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
+.env
