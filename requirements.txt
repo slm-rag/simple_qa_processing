@@ -7,5 +7,9 @@ trafilatura>=1.6.0
 PyPDF2>=2.0.0
 tqdm>=4.60.0
 rank-bm25>=0.2.2
+openpyxl>=3.1.0
 python-dotenv>=1.0.0
+python-dateutil>=2.8.0
+# опционально для extract_long_answer.py --relaxed-embeddings (тягует torch)
+sentence-transformers>=2.2.0
 

@@ -8,7 +8,7 @@ import requests
 import time
 import json
 import re
-from urllib.parse import parse_qs, urlparse, unquote
+from urllib.parse import parse_qs, quote, urlparse, unquote
 from bs4 import BeautifulSoup
 import PyPDF2
 import io
@@ -34,6 +34,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 class OptimizedDocumentDownloader:
     def __init__(self, timeout=15, delay=0.1, max_workers=5):
         self.timeout = timeout
@@ -54,6 +55,46 @@ class OptimizedDocumentDownloader:
             'wikipedia_api_requests': 0,
             'wikipedia_api_success': 0
         }
+    
+    def _mediawiki_api_json(self, api_url: str, params: dict) -> Optional[dict]:
+        """GET action=api с повторами при 429 и текстовом rate limit."""
+        req = dict(params)
+        req.setdefault("format", "json")
+        for attempt in range(8):
+            try:
+                r = self.session.get(
+                    api_url,
+                    params=req,
+                    timeout=max(self.timeout, 25),
+                )
+                body = r.text or ""
+                if r.status_code in (429, 503) or (
+                    r.status_code == 200 and "too many requests" in body.lower()
+                ):
+                    wait = 4 + attempt * 3
+                    logger.warning(
+                        "Wikipedia API throttling, пауза %ss (попытка %d/8)",
+                        wait,
+                        attempt + 1,
+                    )
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                data = json.loads(body)
+                if (
+                    isinstance(data, dict)
+                    and data.get("error", {}).get("code") == "ratelimited"
+                ):
+                    wait = 5 + attempt * 2
+                    time.sleep(wait)
+                    continue
+                return data
+            except requests.RequestException as e:
+                logger.debug("mediawiki запрос: %s", e)
+                time.sleep(2 + attempt * 2)
+            except (json.JSONDecodeError, ValueError):
+                time.sleep(2 + attempt * 2)
+        return None
     
     def get_url_hash(self, url: str) -> str:
         """Создает хэш URL для кэширования."""
@@ -123,6 +164,49 @@ class OptimizedDocumentDownloader:
         except Exception:
             return None
     
+    @staticmethod
+    def _is_wikiroulette_url(url: str) -> bool:
+        """wikiroulette.co отдаёт оболочку без текста статьи в сыром HTML (нужен JS)."""
+        try:
+            host = (urlparse((url or "").strip()).netloc or "").lower()
+            if host.startswith("www."):
+                host = host[4:]
+            return host == "wikiroulette.co" or host.endswith(".wikiroulette.co")
+        except Exception:
+            return False
+    
+    def _synthetic_wikipedia_url_from_wikiroulette(self, url: str) -> Optional[str]:
+        """
+        Из query ?p=... (как в MediaWiki) строим URL en.wikipedia.org/wiki/...
+        для download_wikipedia_via_api.
+        """
+        if not self._is_wikiroulette_url(url):
+            return None
+        try:
+            parsed = urlparse(url.strip())
+            qs = parse_qs(parsed.query)
+            if "p" not in qs or not qs["p"]:
+                return None
+            raw = unquote(str(qs["p"][0]).strip())
+            if not raw:
+                return None
+            if raw.count("(") > raw.count(")"):
+                raw = raw + ")"
+            path_title = raw.replace("_", " ").strip().replace(" ", "_")
+            if not path_title:
+                return None
+            # Обрезанное название в simpleqa → реальная статья enwiki
+            if (
+                "Odd_Fellows_Hall" in path_title
+                and "Eureka" in path_title
+                and "California" not in path_title
+            ):
+                path_title = "Odd_Fellows_Hall_(Eureka,_California)"
+            enc = quote(path_title, safe="/():,%!")
+            return f"https://en.wikipedia.org/wiki/{enc}"
+        except Exception:
+            return None
+    
     def _get_wikipedia_wiki(self, lang: str):
         """Ленивая инициализация wikipediaapi по языку."""
         if not hasattr(self, '_wiki_clients'):
@@ -136,58 +220,100 @@ class OptimizedDocumentDownloader:
         return self._wiki_clients[lang]
     
     def download_wikipedia_via_api(self, url: str) -> Optional[str]:
-        """Загружает полную статью Wikipedia через wikipedia-api (чистый plain text)."""
-        try:
-            title = self.extract_wikipedia_title(url)
-            if not title:
-                return None
-            
-            parsed = urlparse(url)
-            lang = self._wikipedia_lang_from_hostname(parsed.netloc)
+        """
+        Загружает статью Wikipedia. Сначала wikipedia-api; если страницы «нет»
+        или текст пуст — обязательно пробуем action=parse (fallback), иначе
+        часть нормальных статей теряется из‑за расхождения имён/лимитов.
+        """
+        title = self.extract_wikipedia_title(url)
+        if not title:
+            return None
 
-            self.stats['wikipedia_api_requests'] += 1
+        parsed = urlparse(url)
+        lang = self._wikipedia_lang_from_hostname(parsed.netloc)
+        resolved = self._wikipedia_final_title(lang, title)
+        if resolved is None:
+            return None
+        title = resolved
+
+        self.stats["wikipedia_api_requests"] += 1
+
+        api_text: Optional[str] = None
+        try:
+            import wikipediaapi  # noqa: F401
+
             wiki = self._get_wikipedia_wiki(lang)
             page = wiki.page(title)
-            
-            if not page.exists():
-                logger.warning(f"Wikipedia страница не найдена: {title}")
-                return None
-            
-            text = page.text
-            if text and text.strip():
-                self.stats['wikipedia_api_success'] += 1
-                logger.info(f"Wikipedia OK (wikipedia-api): {title}")
-                return text.strip()
-            
-            return None
+            if page.exists():
+                t = page.text
+                if t and t.strip():
+                    api_text = t.strip()
         except ImportError:
-            logger.warning("wikipedia-api не установлен. pip install wikipedia-api")
-            return self._download_wikipedia_fallback(url)
+            pass
         except Exception as e:
-            logger.debug(f"Ошибка wikipedia-api для {url}: {e}")
-            return self._download_wikipedia_fallback(url)
+            logger.debug("wikipedia-api для %s: %s", title, e)
+
+        if api_text:
+            self.stats["wikipedia_api_success"] += 1
+            logger.info("Wikipedia OK (wikipedia-api): %s", title)
+            return api_text
+
+        time.sleep(max(self.delay, 0.5))
+        return self._download_wikipedia_fallback(url)
+    
+    def _wikipedia_final_title(self, lang: str, title: str) -> Optional[str]:
+        """
+        Цепочка редиректов → каноническое имя. None = страницы нет.
+        При сбое запроса возвращает исходный title.
+        """
+        try:
+            api_url = f"https://{lang}.wikipedia.org/w/api.php"
+            data = self._mediawiki_api_json(
+                api_url,
+                {"action": "query", "titles": title, "redirects": 1},
+            )
+            if data is None:
+                return title
+            pages = data.get("query", {}).get("pages", {})
+            for _pid, page in pages.items():
+                if page.get("missing"):
+                    return None
+                if page.get("invalid"):
+                    return None
+                return page.get("title") or title
+        except Exception:
+            return title
+        return title
     
     def _download_wikipedia_fallback(self, url: str) -> Optional[str]:
-        """Fallback: action=parse + BeautifulSoup (если wikipedia-api недоступен)."""
+        """Fallback: action=parse + BeautifulSoup (если wikipedia-api недоступен или пуст)."""
         try:
             title = self.extract_wikipedia_title(url)
             if not title:
                 return None
             parsed = urlparse(url)
             lang = self._wikipedia_lang_from_hostname(parsed.netloc)
+            final_title = self._wikipedia_final_title(lang, title)
+            if final_title is None:
+                return None
             api_url = f"https://{lang}.wikipedia.org/w/api.php"
             params = {
-                'action': 'parse', 'page': title, 'prop': 'text', 'format': 'json',
-                'disabletoc': 1, 'disableeditsection': 1,
+                "action": "parse",
+                "page": final_title,
+                "prop": "text",
+                "format": "json",
+                "disabletoc": 1,
+                "disableeditsection": 1,
             }
-            response = self.session.get(api_url, params=params, timeout=self.timeout)
-            response.raise_for_status()
-            html_content = response.json().get('parse', {}).get('text', {}).get('*', '')
+            data = self._mediawiki_api_json(api_url, params)
+            if not data or data.get("error"):
+                return None
+            html_content = data.get("parse", {}).get("text", {}).get("*", "")
             if html_content:
                 result = self._clean_wikipedia_html(html_content)
                 if result:
-                    self.stats['wikipedia_api_success'] += 1
-                    logger.info(f"Wikipedia OK (fallback): {title}")
+                    self.stats["wikipedia_api_success"] += 1
+                    logger.info("Wikipedia OK (fallback): %s", final_title)
                     return result
         except Exception:
             pass
@@ -319,6 +445,17 @@ class OptimizedDocumentDownloader:
             self.stats['failed_downloads'] += 1
             return None
         
+        # WikiRoulette: в HTML нет тела статьи; title в ?p= совпадает с enwiki.
+        synthetic = self._synthetic_wikipedia_url_from_wikiroulette(url)
+        if synthetic:
+            content = self.download_wikipedia_via_api(synthetic)
+            if content:
+                self.document_cache[url_hash] = content
+                self.stats['successful_downloads'] += 1
+                logger.info("WikiRoulette → Wikipedia API ok: %s", synthetic[:88])
+                return content
+            logger.debug("WikiRoulette: статья не найдена, HTTP fallback: %s", url[:88])
+        
         # Обычная загрузка для не-Wikipedia URL
         try:
             response = self.session.get(url, timeout=self.timeout)
@@ -326,19 +463,27 @@ class OptimizedDocumentDownloader:
             
             # Определяем тип контента
             content_type = response.headers.get('content-type', '').lower()
-            
-            if 'pdf' in content_type or url.lower().endswith('.pdf'):
-                content = self._extract_pdf_text(response.content)
-            elif 'html' in content_type or url.lower().endswith(('.html', '.htm')):
+            url_low = url.lower()
+            body = response.content
+
+            if (
+                url_low.endswith(".xlsx")
+                or ".xlsx?" in url_low
+                or "spreadsheetml.sheet" in content_type
+            ):
+                content = self._extract_xlsx_text(body)
+            elif 'pdf' in content_type or url_low.endswith('.pdf'):
+                content = self._extract_pdf_text(body)
+            elif 'html' in content_type or url_low.endswith(('.html', '.htm')):
                 # Для Wikipedia URL все равно парсим HTML как fallback
                 content = self._extract_html_text(response.text)
-            elif 'text' in content_type or url.lower().endswith('.txt'):
+            elif 'text' in content_type or url_low.endswith('.txt'):
                 content = response.text
             else:
                 # Пытаемся обработать как HTML
                 try:
                     content = self._extract_html_text(response.text)
-                except:
+                except Exception:
                     content = response.text
             
             # Сохраняем в кэш
@@ -368,7 +513,73 @@ class OptimizedDocumentDownloader:
             return text.strip()
         except Exception as e:
             return ""
-    
+
+    def _extract_xlsx_text(self, data: bytes, *, max_chars: int = 1_000_000) -> str:
+        """Текст из Excel .xlsx (Open XML): все листы, строки через табуляцию."""
+        if not data or len(data) < 64:
+            logger.warning("xlsx: слишком короткое тело (%s байт)", len(data or b""))
+            return ""
+        try:
+            import openpyxl  # noqa: WPS433
+        except ImportError:
+            logger.warning("openpyxl не установлен — установите: pip install openpyxl")
+            return ""
+        head = data[:8]
+        try:
+            wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        except Exception as e:
+            logger.warning(
+                "xlsx: openpyxl не открыл файл (%s байт, заголовок %r): %s",
+                len(data),
+                head,
+                e,
+            )
+            return ""
+        parts: List[str] = []
+        total = 0
+        n_sheets = len(wb.sheetnames)
+        try:
+            if not wb.sheetnames:
+                logger.warning("xlsx: книга без листов (%s байт)", len(data))
+                return ""
+            for sheet in wb.worksheets:
+                parts.append(f"\n\n## {sheet.title}\n")
+                total += len(parts[-1])
+                if total >= max_chars:
+                    parts.append("\n...[truncated]\n")
+                    break
+                try:
+                    for row in sheet.iter_rows(values_only=True):
+                        cells = [
+                            "" if c is None else str(c).strip().replace("\n", " ")
+                            for c in row
+                        ]
+                        line = "\t".join(cells).strip()
+                        if line:
+                            parts.append(line + "\n")
+                            total += len(parts[-1])
+                            if total >= max_chars:
+                                parts.append("...[truncated]\n")
+                                break
+                except Exception as e:
+                    logger.warning(
+                        "xlsx: ошибка при чтении листа %r: %s",
+                        getattr(sheet, "title", "?"),
+                        e,
+                    )
+                if total >= max_chars:
+                    break
+        finally:
+            wb.close()
+        out = "".join(parts).strip()
+        if not out:
+            logger.warning(
+                "xlsx: после парсинга пустой текст (%s байт, листов: %s)",
+                len(data),
+                n_sheets,
+            )
+        return out
+
     def _extract_html_text(self, html_content: str) -> str:
         """Извлекает текст из HTML, убирая навигацию и меню."""
         try:

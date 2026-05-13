@@ -59,7 +59,7 @@ python extract_long_answer.py \
 | `-n N` | Обработать только N строк |
 | `--skip-download` | Пропустить скачивание, если CSV с документами уже готов |
 | `--no-llm` | Без OpenRouter на шаге извлечения |
-| `-m` / `--model` | Модель OpenRouter (по умолчанию `openai/gpt-4o`) |
+| `-m` / `--model` | Модель OpenRouter (по умолчанию `google/gemini-2.5-pro`) |
 | `--resume` | Продолжить запись `long_answer` с последней позиции |
 | `--relaxed` | Дополнительный проход LLM при пустом ответе (см. `--help` у скриптов) |
 

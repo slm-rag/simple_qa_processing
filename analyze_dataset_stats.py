@@ -18,48 +18,21 @@ from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
 import statistics
 
-def parse_documents(documents_str: str) -> List[str]:
-    """Парсит строку с документами в список."""
-    if pd.isna(documents_str) or documents_str == '' or documents_str == '[]':
+from extract_long_answer import parse_documents as _parse_documents_with_slots
+
+
+def parse_documents(documents_str: Any) -> List[str]:
+    """
+    Как в extract_long_answer: длина списка = число слотов (пустой слот остаётся \"\"),
+    чтобы индексы совпадали с колонкой urls.
+    """
+    if documents_str is None or (isinstance(documents_str, float) and pd.isna(documents_str)):
         return []
-    try:
-        if isinstance(documents_str, str):
-            documents_str = documents_str.strip()
-            # Если это пустой список
-            if documents_str == '[]' or documents_str == "''" or documents_str == '""':
-                return []
-            
-            # Сначала пытаемся использовать ast.literal_eval (безопаснее для Python литералов)
-            try:
-                parsed = ast.literal_eval(documents_str)
-                if isinstance(parsed, list):
-                    return [str(doc) for doc in parsed if doc and str(doc).strip()]
-                elif isinstance(parsed, str) and parsed:
-                    # Если это одна строка, возвращаем как список с одним элементом
-                    return [parsed]
-                return []
-            except (ValueError, SyntaxError):
-                # Если ast.literal_eval не сработал, пробуем JSON
-                try:
-                    # Заменяем одинарные кавычки на двойные для JSON (осторожно)
-                    # Но это может сломать строки с одинарными кавычками внутри
-                    parsed = json.loads(documents_str)
-                    if isinstance(parsed, list):
-                        return [str(doc) for doc in parsed if doc and str(doc).strip()]
-                    return []
-                except (json.JSONDecodeError, ValueError):
-                    # Если и JSON не сработал, возможно это просто одна строка
-                    if documents_str and documents_str.strip():
-                        return [documents_str]
-                    return []
-        else:
-            # Если это уже список
-            if isinstance(documents_str, list):
-                return [str(doc) for doc in documents_str if doc and str(doc).strip()]
-            return []
-    except Exception as e:
-        # Если ничего не получилось, возвращаем пустой список
-        return []
+    if isinstance(documents_str, list):
+        return _parse_documents_with_slots(json.dumps(documents_str, ensure_ascii=False))
+    if not isinstance(documents_str, str):
+        documents_str = str(documents_str)
+    return _parse_documents_with_slots(documents_str)
 
 
 def parse_long_answer(long_answer_str: str) -> List[str]:
@@ -299,9 +272,9 @@ def analyze_row(row: pd.Series) -> Dict[str, Any]:
         'num_documents_from_other': 0,
     }
     
-    # Парсим документы
+    # Парсим документы (слоты выровнены по urls; считаем только непустые тела)
     documents = parse_documents(row.get('documents', ''))
-    result['num_documents'] = len(documents)
+    result['num_documents'] = sum(1 for d in documents if d and str(d).strip())
     
     # Парсим long_answer
     long_answer_fragments = parse_long_answer(row.get('long_answer', ''))
@@ -342,8 +315,9 @@ def analyze_row(row: pd.Series) -> Dict[str, Any]:
     result['num_documents_from_wikipedia'] = wikipedia_count
     result['num_documents_from_other'] = other_count
     
-    # Вычисляем среднюю длину документов в словах
-    doc_lengths = [count_words(doc) for doc in documents]
+    # Средняя длина только по непустым документам (пустые слоты не размывают среднее)
+    nonempty_docs = [d for d in documents if d and str(d).strip()]
+    doc_lengths = [count_words(doc) for doc in nonempty_docs]
     if doc_lengths:
         result['avg_document_length_words'] = statistics.mean(doc_lengths)
     
